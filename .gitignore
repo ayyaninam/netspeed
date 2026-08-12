@@ -1,0 +1,12 @@
+# Build output
+build/
+
+# Ookla engine binary — downloaded by build.sh, never committed
+# (Ookla's license does not permit redistribution)
+speedtest
+*.tgz
+
+# Local test/debug artifacts
+*.jsonl
+probe.txt
+.DS_Store
