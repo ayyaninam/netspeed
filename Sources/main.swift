@@ -1,6 +1,8 @@
 import SwiftUI
 import AppKit
+import Darwin
 import ServiceManagement
+import SystemConfiguration
 
 // ============================================================
 // NetSpeed — menu bar speed test, engine = Ookla Speedtest CLI
@@ -60,8 +62,12 @@ final class SpeedTestModel: ObservableObject {
     @Published var lastResult: TestResult?
     @Published var launchAtLogin = false
     @Published var loginItemError: String?
+    @Published var menuBarMode: String {
+        didSet { UserDefaults.standard.set(menuBarMode, forKey: Self.menuBarModeKey) }
+    }
 
     static let resultKey = "lastResult"
+    static let menuBarModeKey = "menuBarMode"
 
     private var process: Process?
     private var lineBuffer = ""
@@ -72,6 +78,7 @@ final class SpeedTestModel: ObservableObject {
     private var activityToken: NSObjectProtocol?
 
     init() {
+        menuBarMode = UserDefaults.standard.string(forKey: Self.menuBarModeKey) ?? "full"
         if let d = UserDefaults.standard.data(forKey: Self.resultKey),
            let r = try? JSONDecoder().decode(TestResult.self, from: d) { lastResult = r }
         launchAtLogin = SMAppService.mainApp.status == .enabled
@@ -259,6 +266,376 @@ let relFormatter: RelativeDateTimeFormatter = {
     return f
 }()
 
+// MARK: - Live network monitor
+// Lightweight by design: a 2 s byte-counter poll (getifaddrs syscall, no
+// subprocess), pings + CSV log every 10 s, and per-app sampling (nettop)
+// only while there is actual traffic. Logs: ~/Library/Application Support/
+// NetSpeed/netlog-YYYY-MM-DD.csv, pruned after 14 days.
+
+@MainActor
+final class NetMonitor: ObservableObject {
+    @Published var downBps: Double = 0
+    @Published var upBps: Double = 0
+    @Published var gwPingMs: Double?
+    @Published var inetPingMs: Double?
+    @Published var netName: String = "—"
+    @Published var iface: String = ""
+    @Published var todayDown: UInt64 = 0
+    @Published var todayUp: UInt64 = 0
+    @Published var topApps: [(name: String, bps: Double)] = []
+
+    let logDir: URL
+
+    private var timer: Timer?
+    private var lastIn: UInt32?
+    private var lastOut: UInt32?
+    private var lastSampleAt: Date?
+    private var tickCount = 0
+    private var gateway: String?
+    private var lastNettop: [String: (UInt64, UInt64)] = [:]
+    private var lastNettopAt: Date?
+    private var dayKey = ""
+
+    init() {
+        logDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("NetSpeed", isDirectory: true)
+        try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+        dayKey = Self.dayString()
+        restoreToday()
+        pruneOldLogs()
+        refreshPrimary()
+        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.tick() }
+        }
+        timer?.tolerance = 0.5
+        tick()
+    }
+
+    private func tick() {
+        tickCount += 1
+        sampleCounters()
+        if tickCount % 5 == 1 {
+            refreshPrimary()
+            if let gw = gateway { pingOnce(gw, into: \.gwPingMs) }
+            pingOnce("1.1.1.1", into: \.inetPingMs)
+            sampleTopApps()
+            appendLog()
+            persistToday()
+        }
+    }
+
+    // MARK: interface byte counters (32-bit in if_data — wrap-safe deltas)
+
+    private func sampleCounters() {
+        guard !iface.isEmpty, let (inB, outB) = Self.linkBytes(iface) else { return }
+        let now = Date()
+        if let li = lastIn, let lo = lastOut, let t = lastSampleAt {
+            let dt = now.timeIntervalSince(t)
+            let din = UInt64(inB &- li)
+            let dout = UInt64(outB &- lo)
+            // 1 GB per tick ≈ counter reset or interface flap — skip the sample.
+            if dt > 0.5, din < 1_000_000_000, dout < 1_000_000_000 {
+                downBps = Double(din) / dt
+                upBps = Double(dout) / dt
+                rollDayIfNeeded()
+                todayDown += din
+                todayUp += dout
+            }
+        }
+        lastIn = inB; lastOut = outB; lastSampleAt = now
+    }
+
+    private static func linkBytes(_ name: String) -> (UInt32, UInt32)? {
+        var ifap: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifap) == 0 else { return nil }
+        defer { freeifaddrs(ifap) }
+        var cursor = ifap
+        while let p = cursor {
+            let ifa = p.pointee
+            if let addr = ifa.ifa_addr, addr.pointee.sa_family == UInt8(AF_LINK),
+               String(cString: ifa.ifa_name) == name,
+               let data = ifa.ifa_data {
+                let d = data.assumingMemoryBound(to: if_data.self).pointee
+                return (d.ifi_ibytes, d.ifi_obytes)
+            }
+            cursor = ifa.ifa_next
+        }
+        return nil
+    }
+
+    // MARK: primary interface / network name / gateway (SystemConfiguration)
+
+    private func refreshPrimary() {
+        guard let store = SCDynamicStoreCreate(nil, "NetSpeed" as CFString, nil, nil),
+              let global = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any],
+              let primary = global["PrimaryInterface"] as? String else {
+            iface = ""; netName = "offline"; gateway = nil
+            return
+        }
+        if primary != iface {
+            iface = primary
+            lastIn = nil; lastOut = nil    // never diff counters across interfaces
+        }
+        gateway = global["Router"] as? String
+        if let svc = global["PrimaryService"] as? String,
+           let setup = SCDynamicStoreCopyValue(store, "Setup:/Network/Service/\(svc)" as CFString) as? [String: Any],
+           let name = setup["UserDefinedName"] as? String {
+            netName = name
+        } else {
+            netName = primary
+        }
+    }
+
+    // MARK: ping (one /sbin/ping -c 1 per target per 10 s)
+
+    private func pingOnce(_ target: String, into keyPath: ReferenceWritableKeyPath<NetMonitor, Double?>) {
+        Task.detached(priority: .utility) {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/sbin/ping")
+            p.arguments = ["-c", "1", "-t", "2", target]
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            p.standardInput = FileHandle.nullDevice
+            var ms: Double?
+            if (try? p.run()) != nil {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                p.waitUntilExit()
+                let s = String(decoding: data, as: UTF8.self)
+                if let r = s.range(of: #"time=[0-9.]+"#, options: .regularExpression) {
+                    ms = Double(s[r].dropFirst(5))
+                }
+            }
+            let value = ms
+            await MainActor.run { [weak self] in self?[keyPath: keyPath] = value }
+        }
+    }
+
+    // MARK: per-app usage (nettop deltas; skipped while the line is idle)
+
+    private func sampleTopApps() {
+        guard downBps + upBps > 50_000 else {
+            topApps = []; lastNettop = [:]; lastNettopAt = nil
+            return
+        }
+        Task.detached(priority: .utility) {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/nettop")
+            p.arguments = ["-P", "-x", "-l", "1", "-J", "bytes_in,bytes_out"]
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            p.standardInput = FileHandle.nullDevice
+            guard (try? p.run()) != nil else { return }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            var current: [String: (UInt64, UInt64)] = [:]
+            for line in String(decoding: data, as: UTF8.self).split(separator: "\n").dropFirst() {
+                let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+                guard parts.count >= 3,
+                      let bin = UInt64(parts[parts.count - 2]),
+                      let bout = UInt64(parts[parts.count - 1]) else { continue }
+                var name = parts[0..<(parts.count - 2)].joined(separator: " ")
+                if let dot = name.lastIndex(of: "."),
+                   name[name.index(after: dot)...].allSatisfy(\.isNumber) {
+                    name = String(name[..<dot])
+                }
+                let prev = current[name] ?? (0, 0)
+                current[name] = (prev.0 + bin, prev.1 + bout)
+            }
+            await MainActor.run { [weak self] in self?.digestNettop(current) }
+        }
+    }
+
+    private func digestNettop(_ current: [String: (UInt64, UInt64)]) {
+        let now = Date()
+        defer { lastNettop = current; lastNettopAt = now }
+        guard let t = lastNettopAt, !lastNettop.isEmpty else { return }
+        let dt = now.timeIntervalSince(t)
+        guard dt > 1 else { return }
+        var rates: [(String, Double)] = []
+        for (name, cur) in current {
+            guard let prev = lastNettop[name], cur.0 >= prev.0, cur.1 >= prev.1 else { continue }
+            let bps = Double((cur.0 - prev.0) + (cur.1 - prev.1)) / dt
+            if bps > 10_000 { rates.append((name, bps)) }
+        }
+        topApps = rates.sorted { $0.1 > $1.1 }.prefix(3).map { (name: $0.0, bps: $0.1) }
+    }
+
+    // MARK: daily totals
+
+    private func rollDayIfNeeded() {
+        let today = Self.dayString()
+        if today != dayKey {
+            dayKey = today
+            todayDown = 0; todayUp = 0
+        }
+    }
+
+    private func restoreToday() {
+        let d = UserDefaults.standard
+        if d.string(forKey: "todayKey") == dayKey {
+            todayDown = UInt64(d.double(forKey: "todayDown"))
+            todayUp = UInt64(d.double(forKey: "todayUp"))
+        }
+    }
+
+    private func persistToday() {
+        let d = UserDefaults.standard
+        d.set(dayKey, forKey: "todayKey")
+        d.set(Double(todayDown), forKey: "todayDown")
+        d.set(Double(todayUp), forKey: "todayUp")
+    }
+
+    // MARK: CSV log
+
+    private func appendLog() {
+        let file = logDir.appendingPathComponent("netlog-\(Self.dayString()).csv")
+        if !FileManager.default.fileExists(atPath: file.path) {
+            try? "time,down_Bps,up_Bps,ping_gw_ms,ping_inet_ms,network,iface,top_app\n"
+                .write(to: file, atomically: true, encoding: .utf8)
+        }
+        let safeName = netName.replacingOccurrences(of: ",", with: " ")
+        let topName = (topApps.first?.name ?? "").replacingOccurrences(of: ",", with: " ")
+        let row = String(
+            format: "%@,%.0f,%.0f,%@,%@,%@,%@,%@\n",
+            Self.timeString(), downBps, upBps,
+            gwPingMs.map { String(format: "%.1f", $0) } ?? "",
+            inetPingMs.map { String(format: "%.1f", $0) } ?? "",
+            safeName, iface, topName)
+        if let h = try? FileHandle(forWritingTo: file) {
+            h.seekToEndOfFile()
+            h.write(Data(row.utf8))
+            try? h.close()
+        }
+    }
+
+    private func pruneOldLogs() {
+        let cutoff = Calendar.current.date(byAdding: .day, value: -14, to: Date()) ?? Date()
+        let files = (try? FileManager.default.contentsOfDirectory(at: logDir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        for f in files where f.lastPathComponent.hasPrefix("netlog-") {
+            if let mod = try? f.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
+               mod < cutoff {
+                try? FileManager.default.removeItem(at: f)
+            }
+        }
+    }
+
+    private static func dayString() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: Date())
+    }
+
+    private static func timeString() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f.string(from: Date())
+    }
+}
+
+// MARK: - Rate / byte formatting
+
+func fmtRate(_ bps: Double) -> String {          // menu bar: 0, 42K, 1.2M, 45M
+    if bps < 1_000 { return "0" }
+    if bps < 1_000_000 { return "\(Int(bps / 1_000))K" }
+    if bps < 10_000_000 { return String(format: "%.1fM", bps / 1_000_000) }
+    return "\(Int(bps / 1_000_000))M"
+}
+
+func fmtRateFull(_ bps: Double) -> String {      // popover: 340 KB/s, 1.24 MB/s
+    if bps < 1_000 { return "0 B/s" }
+    if bps < 1_000_000 { return String(format: "%.0f KB/s", bps / 1_000) }
+    return String(format: "%.2f MB/s", bps / 1_000_000)
+}
+
+func fmtBytes(_ b: UInt64) -> String {           // today totals: 82 MB, 2.31 GB
+    let d = Double(b)
+    if d < 1_000_000 { return String(format: "%.0f KB", d / 1_000) }
+    if d < 1_000_000_000 { return String(format: "%.0f MB", d / 1_000_000) }
+    return String(format: "%.2f GB", d / 1_000_000_000)
+}
+
+// MARK: - Menu bar status image
+// Two stacked 8.5 pt rows (↓ over ↑), each with a 4-bar vertical meter
+// (signal style, ascending) + ping in a small side column. Bars = share of
+// the line's measured capacity (last speed test): cyan/purple while normal,
+// amber past ~60%, red when the pipe is effectively full. Colored image, so
+// the ink flips with the menu bar's light/dark appearance.
+
+private func meterLevel(_ bps: Double, capacityMbps: Double?) -> Int {
+    let cap = (capacityMbps ?? 20) * 1_000_000 / 8   // Mbps → bytes/s, default 20 Mbit
+    guard cap > 0 else { return 0 }
+    let u = bps / cap
+    if u > 0.9 { return 4 }
+    if u > 0.6 { return 3 }
+    if u > 0.25 { return 2 }
+    if u > 0.05 { return 1 }
+    return 0
+}
+
+private func meterColor(level: Int, accent: NSColor) -> NSColor {
+    switch level {
+    case 4: return NSColor(red: 1.0, green: 0.35, blue: 0.35, alpha: 1)   // saturated
+    case 3: return NSColor(red: 1.0, green: 0.72, blue: 0.20, alpha: 1)   // getting full
+    default: return accent
+    }
+}
+
+func menuBarStatusImage(down: Double, up: Double, ping: Double?,
+                        capDownMbps: Double?, capUpMbps: Double?) -> NSImage {
+    let showPing = ping != nil
+    let textW: CGFloat = 33
+    let barsX = textW + 2
+    let barsW: CGFloat = 4 * 4.5
+    let pingX = barsX + barsW + 5
+    let width: CGFloat = showPing ? pingX + 17 : barsX + barsW + 2
+    let size = NSSize(width: width, height: 22)
+
+    let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    let ink: NSColor = dark ? .white : .black
+    let accentDown = NSColor(red: 0.16, green: 0.78, blue: 0.99, alpha: 1)
+    let accentUp = NSColor(red: 0.66, green: 0.53, blue: 0.99, alpha: 1)
+
+    let image = NSImage(size: size, flipped: false) { _ in
+        let rowFont = NSFont.monospacedDigitSystemFont(ofSize: 8.5, weight: .medium)
+        let tinyFont = NSFont.monospacedDigitSystemFont(ofSize: 6.5, weight: .regular)
+
+        func draw(_ s: String, x: CGFloat, y: CGFloat, font: NSFont, color: NSColor) {
+            (s as NSString).draw(at: NSPoint(x: x, y: y),
+                                 withAttributes: [.font: font, .foregroundColor: color])
+        }
+        // 4 ascending vertical bars, filled per utilization level.
+        func bars(_ bps: Double, capacity: Double?, accent: NSColor, baseY: CGFloat) {
+            let level = meterLevel(bps, capacityMbps: capacity)
+            let fill = meterColor(level: level, accent: accent)
+            let heights: [CGFloat] = [3.5, 5, 6.5, 8]
+            for i in 0..<4 {
+                let color = i < level ? fill : ink.withAlphaComponent(0.18)
+                color.setFill()
+                NSBezierPath(roundedRect: NSRect(x: barsX + CGFloat(i) * 4.5, y: baseY,
+                                                 width: 2.5, height: heights[i]),
+                             xRadius: 1.25, yRadius: 1.25).fill()
+            }
+        }
+
+        draw("↓", x: 0, y: 11, font: rowFont, color: accentDown)
+        draw(fmtRate(down), x: 7, y: 11, font: rowFont, color: ink.withAlphaComponent(0.92))
+        draw("↑", x: 0, y: 1, font: rowFont, color: accentUp)
+        draw(fmtRate(up), x: 7, y: 1, font: rowFont, color: ink.withAlphaComponent(0.92))
+        bars(down, capacity: capDownMbps, accent: accentDown, baseY: 12.5)
+        bars(up, capacity: capUpMbps, accent: accentUp, baseY: 2)
+        if let ping {
+            draw(String(format: "%.0f", ping.rounded()), x: pingX, y: 10.5, font: rowFont,
+                 color: ink.withAlphaComponent(0.8))
+            draw("ms", x: pingX, y: 2.5, font: tinyFont, color: ink.withAlphaComponent(0.5))
+        }
+        return true
+    }
+    image.isTemplate = false
+    return image
+}
+
 // MARK: - Palette
 
 extension Color {
@@ -278,12 +655,13 @@ extension Color {
 @main
 struct NetSpeedApp: App {
     @StateObject private var model = SpeedTestModel()
+    @StateObject private var monitor = NetMonitor()
 
     var body: some Scene {
         MenuBarExtra {
-            ContentView(model: model)
+            ContentView(model: model, monitor: monitor)
         } label: {
-            MenuBarLabel(model: model)
+            MenuBarLabel(model: model, monitor: monitor)
         }
         .menuBarExtraStyle(.window)
     }
@@ -291,13 +669,21 @@ struct NetSpeedApp: App {
 
 struct MenuBarLabel: View {
     @ObservedObject var model: SpeedTestModel
+    @ObservedObject var monitor: NetMonitor
 
     var body: some View {
         if model.running, let v = model.displaySpeed, v > 0 {
             Text("\(model.phase == .upload ? "↑" : "↓")\(Int(v.rounded()))")
                 .font(.system(size: 12, weight: .semibold).monospacedDigit())
-        } else {
+        } else if model.menuBarMode == "icon" {
             Image(systemName: "speedometer")
+        } else {
+            Image(nsImage: menuBarStatusImage(
+                down: monitor.downBps,
+                up: monitor.upBps,
+                ping: model.menuBarMode == "full" ? monitor.inetPingMs : nil,
+                capDownMbps: model.lastResult?.downloadMbps,
+                capUpMbps: model.lastResult?.uploadMbps))
         }
     }
 }
@@ -306,6 +692,7 @@ struct MenuBarLabel: View {
 
 struct ContentView: View {
     @ObservedObject var model: SpeedTestModel
+    @ObservedObject var monitor: NetMonitor
 
     var body: some View {
         VStack(spacing: 0) {
@@ -318,18 +705,22 @@ struct ContentView: View {
             }
             .frame(height: 248)
             .padding(.top, 4)
-            StatusLine(model: model)
-            Group {
+            if !(model.phase == .idle && model.lastResult != nil) {
+                StatusLine(model: model)
+            }
+            VStack(spacing: 8) {
+                LiveStrip(monitor: monitor)
                 if model.running {
-                    LiveStatsView(model: model)
+                    SectionCard { LiveStatsView(model: model) }
                 } else if let r = model.lastResult {
                     ResultDetailsView(result: r)
                 }
             }
-            .padding(.vertical, 12)
-            .padding(.horizontal, 18)
+            .padding(.top, 8)
+            .padding(.bottom, 12)
+            .padding(.horizontal, 14)
             Divider().overlay(Color.faintLine)
-            FooterView(model: model)
+            FooterView(model: model, monitor: monitor)
         }
         .frame(width: 320)
         .background(LinearGradient(colors: [.bgTop, .bgBottom], startPoint: .top, endPoint: .bottom))
@@ -585,14 +976,7 @@ struct StatusLine: View {
             case .download: caption("Measuring download…")
             case .upload: caption("Measuring upload…")
             case .failed: caption("Test failed")
-            case .idle:
-                if let r = model.lastResult {
-                    TimelineView(.periodic(from: .now, by: 30)) { _ in
-                        caption("Last test \(relFormatter.localizedString(for: r.date, relativeTo: Date()))")
-                    }
-                } else {
-                    caption("Ready — hit GO")
-                }
+            case .idle: caption("Ready — hit GO")
             }
             if model.running {
                 Button { model.cancel() } label: {
@@ -705,7 +1089,16 @@ struct ResultDetailsView: View {
     let result: TestResult
 
     var body: some View {
-        VStack(spacing: 10) {
+        SectionCard {
+            HStack {
+                sectionLabel("LAST TEST")
+                Spacer()
+                TimelineView(.periodic(from: .now, by: 30)) { _ in
+                    Text(relFormatter.localizedString(for: result.date, relativeTo: Date()))
+                        .font(.system(size: 9))
+                        .foregroundStyle(Color.dimText)
+                }
+            }
             HStack(spacing: 0) {
                 latStat("PING", fmtLatency(result.idleLatencyMs))
                 vDivider
@@ -718,7 +1111,9 @@ struct ResultDetailsView: View {
                     .font(.system(size: 9.5).monospacedDigit())
                     .foregroundStyle(Color.dimText.opacity(0.85))
                     .lineLimit(1)
+                    .frame(maxWidth: .infinity)
             }
+            Rectangle().fill(Color.white.opacity(0.05)).frame(height: 1)
             VStack(spacing: 6) {
                 ForEach(activities(for: result), id: \.label) { a in
                     HStack(spacing: 7) {
@@ -790,6 +1185,83 @@ struct ResultDetailsView: View {
     }
 }
 
+// MARK: - Section card container
+
+struct SectionCard<Content: View>: View {
+    private let content: Content
+    init(@ViewBuilder _ builder: () -> Content) { content = builder() }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) { content }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.035)))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.05), lineWidth: 1))
+    }
+}
+
+func sectionLabel(_ s: String, color: Color = .dimText) -> some View {
+    Text(s)
+        .font(.system(size: 8.5, weight: .heavy))
+        .tracking(0.8)
+        .foregroundStyle(color)
+}
+
+// MARK: - Live monitor card (always visible in the popover)
+
+struct LiveStrip: View {
+    @ObservedObject var monitor: NetMonitor
+
+    var body: some View {
+        SectionCard {
+            HStack {
+                sectionLabel("LIVE", color: .accentRPM)
+                Spacer()
+                Text("\(monitor.netName) (\(monitor.iface.isEmpty ? "—" : monitor.iface))")
+                    .font(.system(size: 9))
+                    .foregroundStyle(Color.dimText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            HStack(spacing: 0) {
+                rateCol(icon: "arrow.down", color: .accentDL, value: fmtRateFull(monitor.downBps))
+                Rectangle().fill(Color.faintLine).frame(width: 1, height: 20)
+                rateCol(icon: "arrow.up", color: .accentUL, value: fmtRateFull(monitor.upBps))
+            }
+            Text(detailLine)
+                .font(.system(size: 9.5).monospacedDigit())
+                .foregroundStyle(Color.dimText)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if !monitor.topApps.isEmpty {
+                Text("top: " + monitor.topApps.map { "\($0.name) \(fmtRate($0.bps))" }.joined(separator: " · "))
+                    .font(.system(size: 9.5).monospacedDigit())
+                    .foregroundStyle(Color.dimText)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+        }
+    }
+
+    private func rateCol(icon: String, color: Color, value: String) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon).font(.system(size: 9, weight: .heavy)).foregroundStyle(color)
+            Text(value)
+                .font(.system(size: 13, weight: .semibold, design: .rounded).monospacedDigit())
+                .foregroundStyle(.white)
+                .contentTransition(.numericText())
+        }
+        .frame(maxWidth: .infinity)
+        .animation(.default, value: value)
+    }
+
+    private var detailLine: String {
+        let gw = monitor.gwPingMs.map { String(format: "%.1f ms", $0) } ?? "—"
+        let net = monitor.inetPingMs.map { String(format: "%.0f ms", $0) } ?? "—"
+        return "gw \(gw) · net \(net) · today ↓\(fmtBytes(monitor.todayDown)) ↑\(fmtBytes(monitor.todayUp))"
+    }
+}
+
 // MARK: - Live stats (while a test is running)
 
 struct LiveStatsView: View {
@@ -823,6 +1295,7 @@ struct LiveStatsView: View {
 
 struct FooterView: View {
     @ObservedObject var model: SpeedTestModel
+    @ObservedObject var monitor: NetMonitor
 
     var body: some View {
         HStack {
@@ -831,6 +1304,13 @@ struct FooterView: View {
                 .foregroundStyle(Color.dimText.opacity(0.7))
             Spacer()
             Menu {
+                Picker("Menu bar", selection: $model.menuBarMode) {
+                    Text("Speeds + ping").tag("full")
+                    Text("Speeds only").tag("speeds")
+                    Text("Icon only").tag("icon")
+                }
+                Button("Open logs folder") { NSWorkspace.shared.open(monitor.logDir) }
+                Divider()
                 Toggle("Launch at login", isOn: Binding(
                     get: { model.launchAtLogin },
                     set: { model.setLaunchAtLogin($0) }))

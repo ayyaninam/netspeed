@@ -7,6 +7,9 @@ A speedtest.net-style internet speed test that lives in your macOS menu bar. One
 ![Platform](https://img.shields.io/badge/macOS-13%2B-blue) ![Swift](https://img.shields.io/badge/Swift-5.9-orange) ![License](https://img.shields.io/badge/license-MIT-green)
 
 ```
+   menu bar, always on:   ↓1.2M ▂▄▆█  27
+                          ↑340K ▂▄        ms
+
         ┌────────────────────────────────┐
         │   DOWNLOAD ↓        UPLOAD ↑   │
         │   142.5 Mbps        38.1 Mbps  │
@@ -15,17 +18,21 @@ A speedtest.net-style internet speed test that lives in your macOS menu bar. One
         │      0╱   needle sweeps  ╲1000 │
         │      │   with live data   │    │
         │      │      ( GO )        │    │
-        │        Last test 2 min ago     │
         │                                │
-        │   PING     LOADED   BUFFERBLOAT│
-        │   15.1 ms  26.6 ms  +11.5 ms A │
-        │   jitter 3.0 ms · loss 0% · …  │
-        │                                │
-        │   Video meetings    ● smooth   │
-        │   4K streaming      ● smooth   │
-        │   HD streaming      ● smooth   │
-        │   Gaming            ● low ping │
-        │   Browsing          ● snappy   │
+        │ ┌ LIVE ─────────── Wi-Fi (en0)┐│
+        │ │   ↓ 53 KB/s  │  ↑ 18 KB/s  ││
+        │ │ gw 1.6 ms · net 27 ms ·     ││
+        │ │ today ↓54 MB ↑78 MB         ││
+        │ └─────────────────────────────┘│
+        │ ┌ LAST TEST ────────── 3 hr ago┐│
+        │ │  PING    LOADED  BUFFERBLOAT││
+        │ │  15.1 ms 26.6 ms +11.5 ms A ││
+        │ │ jitter 3.0 ms · loss 0% · … ││
+        │ │ ─────────────────────────── ││
+        │ │ Video meetings    ● smooth  ││
+        │ │ 4K streaming      ● smooth  ││
+        │ │ Gaming            ● low ping││
+        │ └─────────────────────────────┘│
         └────────────────────────────────┘
 ```
 
@@ -37,6 +44,10 @@ A speedtest.net-style internet speed test that lives in your macOS menu bar. One
 - **Latency under load** — idle ping, loaded latency (Ookla's `iqm` during saturation, worst direction), and a **bufferbloat grade (A+ to F)** on the Waveform scale. This is the number that explains why calls freeze while something downloads.
 - **Real-world verdicts** — video meetings, 4K streaming, HD streaming, gaming, and browsing each get a green/yellow/red dot with a one-phrase reason, computed from your measured bandwidth, ping, loaded latency, and packet loss.
 - **The details** — jitter, packet loss, test server, and a shareable speedtest.net result link (gear menu).
+- **Always-on live monitor in the menu bar** — your Mac's actual ↓/↑ throughput stacked in two tiny rows, each with a colored 4-bar utilization meter, plus internet ping in a small side column. Updates every 2 s. Three display modes in the gear menu (speeds + ping / speeds only / icon only).
+- **The bars mean something** — they show how full your pipe is relative to *your measured line speed* (last test): cyan/purple while normal, **amber past 60%, red when saturated**. Ink flips automatically for light/dark menu bars.
+- **LIVE card in the popover** — current rates, gateway ping vs internet ping, network name + interface, today's data totals, and the top 3 apps using the connection right now. Test results live in their own LAST TEST card below it.
+- **CSV logs that answer "when was it bad and why"** — one row every 10 s: throughput, both pings, network name, interface, top app. Gear → "Open logs folder".
 - **Menu bar citizen** — no Dock icon, last result persists across restarts, optional Launch at Login, Stop button mid-test.
 - **Self-archiving** — the installed app embeds its own source code (`NetSpeed.app/Contents/Resources/`), so any installed copy can rebuild itself.
 
@@ -118,13 +129,55 @@ Run Apple's built-in `networkquality` and you may see an "idle latency" 20–50�
 
 NetSpeed reports the speedtest.net-style number because that's what isolates *your line and ISP* from the rest of the internet.
 
+## Live monitor & logs
+
+The monitor is deliberately boring: a 2-second byte-counter poll (`getifaddrs` syscall — no subprocess), pings + one CSV row every 10 seconds, and per-app sampling (`nettop`) only while the line is actually busy. Idle CPU rounds to zero.
+
+Logs live in `~/Library/Application Support/NetSpeed/netlog-YYYY-MM-DD.csv`, one file per day, auto-pruned after 14 days (~1 MB/day):
+
+```csv
+time,down_Bps,up_Bps,ping_gw_ms,ping_inet_ms,network,iface,top_app
+2026-08-13 22:35:05,1121346,38402,1.2,27.1,USB 10/100/1000 LAN 2,en8,Google Chrome
+```
+
+Reading a bad moment out of the log:
+
+| Pattern | Diagnosis |
+|---|---|
+| `ping_gw` high | Your Wi-Fi / local hop is the problem |
+| `ping_gw` fine, `ping_inet` high | Your ISP or the path beyond the router |
+| Both fine but slow | Check `top_app` — something was eating the line |
+| `network` column changed | You were on a different network when it happened |
+
+Implementation notes: interface byte counters are 32-bit on macOS, so deltas use wrap-safe math; the primary interface, its human name, and the gateway IP come from SystemConfiguration (no shelling out); per-app rates are deltas of `nettop -P -x` cumulative counters between samples. The menu bar item is a small NSImage redrawn each tick (stacked 8.5 pt rows + bar meter) because multi-line SwiftUI labels are unreliable in `MenuBarExtra`; it reads the effective appearance at render time so text stays legible on light and dark menu bars.
+
+## Why there's no "fix bufferbloat" button
+
+An earlier version shipped a single-Mac traffic-shaping toggle (`dummynet` + `pf`, 90% caps, short queues — the host-side version of router SQM). We then A/B/A-tested it properly: ~2,600 latency samples across idle / download-saturated / upload-saturated scenarios, shield off → on → off, plus localhost-throughput and restore checks. It lost:
+
+| Measured (saturated line, ping to nearest server) | Shield off | Shield on |
+|---|---|---|
+| p95 latency | 25.2 ms | 22.6 ms |
+| p99 latency | 29.5 ms | 23.8 ms |
+| Download throughput | 16.0 Mbit/s | 10.1 Mbit/s (**−37%**) |
+| Upload throughput | 19.0 Mbit/s | 15.4 Mbit/s (−19%) |
+
+Two structural reasons, beyond one test line:
+
+1. **macOS `dummynet` is droptail-only.** There is no `sched` command on macOS — no fq_codel, no CAKE, no flow queuing. A droptail FIFO short queue controls latency by dropping, which taxes long-RTT TCP flows far harder than the ~10% a real SQM costs.
+2. **On a well-managed line there's nothing to win.** This line added only ~4 ms at p95 under full saturation *without* any shaping. If your line grades A on its own, host-side shaping can only subtract bandwidth.
+
+So: NetSpeed *measures* bufferbloat honestly and leaves fixing it where it actually works — the router (OpenWrt/CAKE, MikroTik, Ubiquiti Smart Queues), or capping the bulk apps themselves. If your grade is C or worse, that's the path.
+
 ## Uninstall
 
 ```sh
 rm -rf /Applications/NetSpeed.app
+rm -rf ~/Library/Application\ Support/NetSpeed        # monitor logs
+rm -f ~/Library/Preferences/com.ayyan.netspeed.plist  # preferences
 ```
 
-If you enabled Launch at Login, macOS removes the login item with the app. Preferences (last result) live in `~/Library/Preferences/com.ayyan.netspeed.plist` if you want a truly clean sweep.
+If you enabled Launch at Login, macOS removes the login item with the app.
 
 ## Development
 
