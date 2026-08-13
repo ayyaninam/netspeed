@@ -133,7 +133,7 @@ NetSpeed reports the speedtest.net-style number because that's what isolates *yo
 
 The monitor is deliberately boring: a 1-second byte-counter poll (`getifaddrs` syscall — no subprocess), pings every 5 seconds, one CSV row every 10 seconds, and per-app sampling (`nettop`) only while the line is actually busy. Idle CPU rounds to zero.
 
-Logs live in `~/Library/Application Support/NetSpeed/netlog-YYYY-MM-DD.csv`, one file per day, auto-pruned after 14 days (~1 MB/day):
+Logs live in `~/Library/Application Support/NetSpeed/netlog-YYYY-MM-DD.csv` — only the current day's file is kept (~1 MB); older files are removed at launch and at midnight rollover:
 
 ```csv
 time,down_Bps,up_Bps,ping_gw_ms,ping_inet_ms,network,iface,top_app

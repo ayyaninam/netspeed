@@ -471,6 +471,7 @@ final class NetMonitor: ObservableObject {
         if today != dayKey {
             dayKey = today
             todayDown = 0; todayUp = 0
+            pruneOldLogs()
         }
     }
 
@@ -512,14 +513,13 @@ final class NetMonitor: ObservableObject {
         }
     }
 
+    // Retention: today's file only — anything else gets removed (runs at
+    // launch and again on every day rollover).
     private func pruneOldLogs() {
-        let cutoff = Calendar.current.date(byAdding: .day, value: -14, to: Date()) ?? Date()
-        let files = (try? FileManager.default.contentsOfDirectory(at: logDir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
-        for f in files where f.lastPathComponent.hasPrefix("netlog-") {
-            if let mod = try? f.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,
-               mod < cutoff {
-                try? FileManager.default.removeItem(at: f)
-            }
+        let keep = "netlog-\(Self.dayString()).csv"
+        let files = (try? FileManager.default.contentsOfDirectory(at: logDir, includingPropertiesForKeys: nil)) ?? []
+        for f in files where f.lastPathComponent.hasPrefix("netlog-") && f.lastPathComponent != keep {
+            try? FileManager.default.removeItem(at: f)
         }
     }
 
