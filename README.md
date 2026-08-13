@@ -44,7 +44,7 @@ A speedtest.net-style internet speed test that lives in your macOS menu bar. One
 - **Latency under load** — idle ping, loaded latency (Ookla's `iqm` during saturation, worst direction), and a **bufferbloat grade (A+ to F)** on the Waveform scale. This is the number that explains why calls freeze while something downloads.
 - **Real-world verdicts** — video meetings, 4K streaming, HD streaming, gaming, and browsing each get a green/yellow/red dot with a one-phrase reason, computed from your measured bandwidth, ping, loaded latency, and packet loss.
 - **The details** — jitter, packet loss, test server, and a shareable speedtest.net result link (gear menu).
-- **Always-on live monitor in the menu bar** — your Mac's actual ↓/↑ throughput stacked in two tiny rows, each with a colored 4-bar utilization meter, plus internet ping in a small side column. Updates every 2 s. Three display modes in the gear menu (speeds + ping / speeds only / icon only).
+- **Always-on live monitor in the menu bar** — your Mac's actual ↓/↑ throughput stacked in two tiny rows, each with a colored 4-bar utilization meter, plus internet ping in a small side column. Speeds update every second, ping every 5 s. Three display modes in the gear menu (speeds + ping / speeds only / icon only).
 - **The bars mean something** — they show how full your pipe is relative to *your measured line speed* (last test): cyan/purple while normal, **amber past 60%, red when saturated**. Ink flips automatically for light/dark menu bars.
 - **LIVE card in the popover** — current rates, gateway ping vs internet ping, network name + interface, today's data totals, and the top 3 apps using the connection right now. Test results live in their own LAST TEST card below it.
 - **CSV logs that answer "when was it bad and why"** — one row every 10 s: throughput, both pings, network name, interface, top app. Gear → "Open logs folder".
@@ -131,7 +131,7 @@ NetSpeed reports the speedtest.net-style number because that's what isolates *yo
 
 ## Live monitor & logs
 
-The monitor is deliberately boring: a 2-second byte-counter poll (`getifaddrs` syscall — no subprocess), pings + one CSV row every 10 seconds, and per-app sampling (`nettop`) only while the line is actually busy. Idle CPU rounds to zero.
+The monitor is deliberately boring: a 1-second byte-counter poll (`getifaddrs` syscall — no subprocess), pings every 5 seconds, one CSV row every 10 seconds, and per-app sampling (`nettop`) only while the line is actually busy. Idle CPU rounds to zero.
 
 Logs live in `~/Library/Application Support/NetSpeed/netlog-YYYY-MM-DD.csv`, one file per day, auto-pruned after 14 days (~1 MB/day):
 

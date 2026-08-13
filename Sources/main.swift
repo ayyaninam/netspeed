@@ -304,20 +304,22 @@ final class NetMonitor: ObservableObject {
         restoreToday()
         pruneOldLogs()
         refreshPrimary()
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
         }
-        timer?.tolerance = 0.5
+        timer?.tolerance = 0.2
         tick()
     }
 
     private func tick() {
         tickCount += 1
-        sampleCounters()
-        if tickCount % 5 == 1 {
-            refreshPrimary()
+        sampleCounters()                 // every 1 s
+        if tickCount % 5 == 1 {          // every 5 s
             if let gw = gateway { pingOnce(gw, into: \.gwPingMs) }
             pingOnce("1.1.1.1", into: \.inetPingMs)
+        }
+        if tickCount % 10 == 1 {         // every 10 s
+            refreshPrimary()
             sampleTopApps()
             appendLog()
             persistToday()
