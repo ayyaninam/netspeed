@@ -266,6 +266,60 @@ let relFormatter: RelativeDateTimeFormatter = {
     return f
 }()
 
+// MARK: - System metrics (CPU / memory straight from Mach — no subprocesses)
+
+final class SysSampler {
+    private var prevCPU: host_cpu_load_info?
+
+    func cpuPercent() -> Float {
+        var size = mach_msg_type_number_t(MemoryLayout<host_cpu_load_info>.size / MemoryLayout<integer_t>.size)
+        var info = host_cpu_load_info()
+        let ok = withUnsafeMutablePointer(to: &info) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(size)) {
+                host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, $0, &size)
+            }
+        }
+        guard ok == KERN_SUCCESS else { return 0 }
+        defer { prevCPU = info }
+        guard let p = prevCPU else { return 0 }
+        let user = Double(info.cpu_ticks.0 &- p.cpu_ticks.0)
+        let sys = Double(info.cpu_ticks.1 &- p.cpu_ticks.1)
+        let idle = Double(info.cpu_ticks.2 &- p.cpu_ticks.2)
+        let nice = Double(info.cpu_ticks.3 &- p.cpu_ticks.3)
+        let total = user + sys + idle + nice
+        guard total > 0 else { return 0 }
+        return Float(min((user + sys + nice) / total * 100, 100))
+    }
+
+    // Matches Activity Monitor's "Memory Used": active + wired + compressed.
+    func ramPercent() -> Float {
+        var stats = vm_statistics64()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<integer_t>.size)
+        let ok = withUnsafeMutablePointer(to: &stats) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+            }
+        }
+        guard ok == KERN_SUCCESS else { return 0 }
+        let page = Double(vm_kernel_page_size)
+        let used = (Double(stats.active_count) + Double(stats.wire_count)
+                    + Double(stats.compressor_page_count)) * page
+        let total = Double(ProcessInfo.processInfo.physicalMemory)
+        guard total > 0 else { return 0 }
+        return Float(min(used / total * 100, 100))
+    }
+}
+
+// One point of history. Float keeps the hour's ring at ~20 KB.
+struct Sample {
+    let t: Date
+    let down: Float
+    let up: Float
+    let ping: Float
+    let cpu: Float
+    let ram: Float
+}
+
 // MARK: - Live network monitor
 // Lightweight by design: a 2 s byte-counter poll (getifaddrs syscall, no
 // subprocess), pings + CSV log every 10 s, and per-app sampling (nettop)
@@ -283,6 +337,11 @@ final class NetMonitor: ObservableObject {
     @Published var todayDown: UInt64 = 0
     @Published var todayUp: UInt64 = 0
     @Published var topApps: [(name: String, bps: Double)] = []
+    @Published var cpuPct: Float = 0
+    @Published var ramPct: Float = 0
+    @Published private(set) var history: [Sample] = []
+
+    static let historyCap = 720          // 720 × 5 s = 1 hour
 
     let logDir: URL
 
@@ -295,6 +354,8 @@ final class NetMonitor: ObservableObject {
     private var lastNettop: [String: (UInt64, UInt64)] = [:]
     private var lastNettopAt: Date?
     private var dayKey = ""
+    private let sys = SysSampler()
+    private var lastGoodPing: Float = 0
 
     init() {
         logDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -317,12 +378,26 @@ final class NetMonitor: ObservableObject {
         if tickCount % 5 == 1 {          // every 5 s
             if let gw = gateway { pingOnce(gw, into: \.gwPingMs) }
             pingOnce("1.1.1.1", into: \.inetPingMs)
+            recordHistory()
         }
         if tickCount % 10 == 1 {         // every 10 s
             refreshPrimary()
             sampleTopApps()
             appendLog()
             persistToday()
+        }
+    }
+
+    // MARK: history ring (1 hour at 5 s resolution)
+
+    private func recordHistory() {
+        cpuPct = sys.cpuPercent()
+        ramPct = sys.ramPercent()
+        if let p = inetPingMs, p > 0 { lastGoodPing = Float(p) }
+        history.append(Sample(t: Date(), down: Float(downBps), up: Float(upBps),
+                              ping: lastGoodPing, cpu: cpuPct, ram: ramPct))
+        if history.count > Self.historyCap {
+            history.removeFirst(history.count - Self.historyCap)
         }
     }
 
@@ -584,9 +659,8 @@ private func meterColor(level: Int, accent: NSColor) -> NSColor {
     }
 }
 
-func menuBarStatusImage(down: Double, up: Double, ping: Double?,
+func menuBarStatusImage(down: Double, up: Double, ping: Double?, showPing: Bool,
                         capDownMbps: Double?, capUpMbps: Double?) -> NSImage {
-    let showPing = ping != nil
     let textW: CGFloat = 33
     let barsX = textW + 2
     let barsW: CGFloat = 4 * 4.5
@@ -627,9 +701,9 @@ func menuBarStatusImage(down: Double, up: Double, ping: Double?,
         draw(fmtRate(up), x: 7, y: 1, font: rowFont, color: ink.withAlphaComponent(0.92))
         bars(down, capacity: capDownMbps, accent: accentDown, baseY: 12.5)
         bars(up, capacity: capUpMbps, accent: accentUp, baseY: 2)
-        if let ping {
-            draw(String(format: "%.0f", ping.rounded()), x: pingX, y: 10.5, font: rowFont,
-                 color: ink.withAlphaComponent(0.8))
+        if showPing {
+            let text = ping.map { String(format: "%.0f", $0.rounded()) } ?? "—"
+            draw(text, x: pingX, y: 10.5, font: rowFont, color: ink.withAlphaComponent(0.8))
             draw("ms", x: pingX, y: 2.5, font: tinyFont, color: ink.withAlphaComponent(0.5))
         }
         return true
@@ -683,7 +757,8 @@ struct MenuBarLabel: View {
             Image(nsImage: menuBarStatusImage(
                 down: monitor.downBps,
                 up: monitor.upBps,
-                ping: model.menuBarMode == "full" ? monitor.inetPingMs : nil,
+                ping: monitor.inetPingMs,
+                showPing: model.menuBarMode == "full",
                 capDownMbps: model.lastResult?.downloadMbps,
                 capUpMbps: model.lastResult?.uploadMbps))
         }
@@ -705,18 +780,12 @@ struct ContentView: View {
                 GaugeView(model: model)
                 centerOverlay
             }
-            .frame(height: 248)
-            .padding(.top, 4)
-            if !(model.phase == .idle && model.lastResult != nil) {
-                StatusLine(model: model)
-            }
+            .frame(height: 206)
+            StatusLine(model: model)
             VStack(spacing: 8) {
+                HistoryPanel(monitor: monitor)
                 LiveStrip(monitor: monitor)
-                if model.running {
-                    SectionCard { LiveStatsView(model: model) }
-                } else if let r = model.lastResult {
-                    ResultDetailsView(result: r)
-                }
+                ResultDetailsView(result: model.lastResult)
             }
             .padding(.top, 8)
             .padding(.bottom, 12)
@@ -1038,7 +1107,12 @@ struct Activity {
 // Thresholds: Zoom group HD ≈ 4 Mbps each way; Netflix 4K 15 / HD 5 Mbps;
 // gaming wants <60 ms ping. Loaded latency decides how it feels when the
 // line is busy with anything else; packet loss hits realtime traffic first.
-func activities(for r: TestResult) -> [Activity] {
+func activities(for result: TestResult?) -> [Activity] {
+    let blank = [("video.fill", "Video meetings"), ("4k.tv", "4K streaming"), ("tv", "HD streaming"),
+                 ("gamecontroller.fill", "Gaming"), ("safari", "Browsing")]
+    guard let r = result else {
+        return blank.map { Activity(icon: $0.0, label: $0.1, verdict: .unknown) }
+    }
     let idle = r.idleLatencyMs
     let loaded = r.loadedLatencyMs
     let loss = r.packetLossPct
@@ -1087,34 +1161,41 @@ func activities(for r: TestResult) -> [Activity] {
     ]
 }
 
+// Every row is always present — a MenuBarExtra(.window) panel dismisses itself
+// when its content changes height, so this view must render one fixed shape
+// whether or not a test has ever run.
 struct ResultDetailsView: View {
-    let result: TestResult
+    let result: TestResult?
 
     var body: some View {
         SectionCard {
             HStack {
                 sectionLabel("LAST TEST")
                 Spacer()
-                TimelineView(.periodic(from: .now, by: 30)) { _ in
-                    Text(relFormatter.localizedString(for: result.date, relativeTo: Date()))
+                if let result {
+                    TimelineView(.periodic(from: .now, by: 30)) { _ in
+                        Text(relFormatter.localizedString(for: result.date, relativeTo: Date()))
+                            .font(.system(size: 9))
+                            .foregroundStyle(Color.dimText)
+                    }
+                } else {
+                    Text("no test yet")
                         .font(.system(size: 9))
                         .foregroundStyle(Color.dimText)
                 }
             }
             HStack(spacing: 0) {
-                latStat("PING", fmtLatency(result.idleLatencyMs))
+                latStat("PING", fmtLatency(result?.idleLatencyMs))
                 vDivider
-                latStat("LOADED", fmtLatency(result.loadedLatencyMs))
+                latStat("LOADED", fmtLatency(result?.loadedLatencyMs))
                 vDivider
                 bloatStat
             }
-            if let meta = metaLine {
-                Text(meta)
-                    .font(.system(size: 9.5).monospacedDigit())
-                    .foregroundStyle(Color.dimText.opacity(0.85))
-                    .lineLimit(1)
-                    .frame(maxWidth: .infinity)
-            }
+            Text(metaLine)
+                .font(.system(size: 9.5).monospacedDigit())
+                .foregroundStyle(Color.dimText.opacity(0.85))
+                .lineLimit(1)
+                .frame(maxWidth: .infinity)
             Rectangle().fill(Color.white.opacity(0.05)).frame(height: 1)
             VStack(spacing: 6) {
                 ForEach(activities(for: result), id: \.label) { a in
@@ -1137,14 +1218,15 @@ struct ResultDetailsView: View {
         }
     }
 
-    private var metaLine: String? {
+    private var metaLine: String {
+        guard let result else { return "run a test to see jitter, loss and server" }
         var parts: [String] = []
         if let j = result.jitterMs { parts.append("jitter \(fmtLatency(j))") }
         if let l = fmtLoss(result.packetLossPct) { parts.append("loss \(l)") }
         if let s = result.serverName {
             parts.append([s, result.serverLocation].compactMap { $0 }.joined(separator: ", "))
         }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+        return parts.isEmpty ? " " : parts.joined(separator: " · ")
     }
 
     private var vDivider: some View {
@@ -1169,10 +1251,10 @@ struct ResultDetailsView: View {
                 .font(.system(size: 8.5, weight: .semibold)).tracking(0.7)
                 .foregroundStyle(Color.dimText)
             HStack(spacing: 4) {
-                Text(result.bloatMs.map { "+\(fmtLatency($0))" } ?? "—")
+                Text(result?.bloatMs.map { "+\(fmtLatency($0))" } ?? "—")
                     .font(.system(size: 13, weight: .semibold, design: .rounded).monospacedDigit())
                     .foregroundStyle(.white)
-                if let b = result.bloatMs {
+                if let b = result?.bloatMs {
                     let (grade, color) = bloatGrade(b)
                     Text(grade)
                         .font(.system(size: 9, weight: .heavy))
@@ -1194,11 +1276,10 @@ struct SectionCard<Content: View>: View {
     init(@ViewBuilder _ builder: () -> Content) { content = builder() }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) { content }
-            .padding(10)
+        VStack(alignment: .leading, spacing: 8) { content }
+            .padding(11)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.035)))
-            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.white.opacity(0.05), lineWidth: 1))
     }
 }
 
@@ -1207,6 +1288,170 @@ func sectionLabel(_ s: String, color: Color = .dimText) -> some View {
         .font(.system(size: 8.5, weight: .heavy))
         .tracking(0.8)
         .foregroundStyle(color)
+}
+
+// MARK: - History charts
+// Hand-drawn Paths rather than Swift Charts: 4 charts × 720 points needs to
+// stay cheap, and a shared scrub line across all of them is easier this way.
+
+struct ChartSeries {
+    let values: [Float]
+    let color: Color
+}
+
+struct MetricChart: View {
+    let label: String
+    let series: [ChartSeries]
+    let fmt: (Float) -> String
+    let scrub: Int?
+    var minTop: Float = 1
+    var fixedTop: Float? = nil
+    var height: CGFloat = 32
+
+    private var top: Float {
+        if let fixedTop { return fixedTop }
+        let peak = series.flatMap(\.values).max() ?? 0
+        return Swift.max(peak * 1.15, minTop)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(label)
+                    .font(.system(size: 8, weight: .heavy)).tracking(0.7)
+                    .foregroundStyle(Color.dimText)
+                Spacer()
+                ForEach(series.indices, id: \.self) { i in
+                    let vals = series[i].values
+                    let idx = scrub.map { Swift.min($0, vals.count - 1) } ?? (vals.count - 1)
+                    Text(vals.indices.contains(idx) ? fmt(vals[idx]) : "—")
+                        .font(.system(size: 9.5, weight: .semibold).monospacedDigit())
+                        .foregroundStyle(series[i].color)
+                }
+            }
+            GeometryReader { geo in
+                ZStack(alignment: .topLeading) {
+                    ForEach(series.indices, id: \.self) { i in
+                        let s = series[i]
+                        area(s.values, in: geo.size)
+                            .fill(LinearGradient(colors: [s.color.opacity(0.28), s.color.opacity(0.02)],
+                                                 startPoint: .top, endPoint: .bottom))
+                        line(s.values, in: geo.size)
+                            .stroke(s.color, style: StrokeStyle(lineWidth: 1.2, lineJoin: .round))
+                    }
+                    if let scrub, let n = series.first?.values.count, n > 1 {
+                        let x = geo.size.width * CGFloat(Swift.min(scrub, n - 1)) / CGFloat(n - 1)
+                        Rectangle().fill(Color.white.opacity(0.35))
+                            .frame(width: 1, height: geo.size.height)
+                            .offset(x: x)
+                    }
+                }
+            }
+            .frame(height: height)
+            .background(RoundedRectangle(cornerRadius: 4).fill(Color.white.opacity(0.03)))
+        }
+    }
+
+    private func points(_ values: [Float], in size: CGSize) -> [CGPoint] {
+        guard values.count > 1 else { return [] }
+        let dx = size.width / CGFloat(values.count - 1)
+        let cap = top
+        return values.enumerated().map { i, v in
+            let frac = cap > 0 ? CGFloat(Swift.max(v, 0) / cap) : 0
+            let y = size.height - Swift.min(frac, 1) * size.height
+            return CGPoint(x: CGFloat(i) * dx, y: y.isFinite ? y : size.height)
+        }
+    }
+
+    private func line(_ values: [Float], in size: CGSize) -> Path {
+        var p = Path()
+        let pts = points(values, in: size)
+        guard let first = pts.first else { return p }
+        p.move(to: first)
+        for pt in pts.dropFirst() { p.addLine(to: pt) }
+        return p
+    }
+
+    private func area(_ values: [Float], in size: CGSize) -> Path {
+        var p = line(values, in: size)
+        let pts = points(values, in: size)
+        guard let first = pts.first, let last = pts.last else { return p }
+        p.addLine(to: CGPoint(x: last.x, y: size.height))
+        p.addLine(to: CGPoint(x: first.x, y: size.height))
+        p.closeSubpath()
+        return p
+    }
+}
+
+struct HistoryPanel: View {
+    @ObservedObject var monitor: NetMonitor
+    @State private var scrub: Int?
+
+    var body: some View {
+        let h = monitor.history
+        SectionCard {
+            HStack {
+                sectionLabel("LAST HOUR", color: .accentRPM)
+                Spacer()
+                Text(stampText(h))
+                    .font(.system(size: 9).monospacedDigit())
+                    .foregroundStyle(scrub == nil ? Color.dimText : .white.opacity(0.8))
+            }
+            if h.count < 2 {
+                Text("Collecting… charts appear after a few samples.")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.dimText)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 176)
+            } else {
+                GeometryReader { geo in
+                    VStack(alignment: .leading, spacing: 6) {
+                        MetricChart(label: "NETWORK  ↓ / ↑",
+                                    series: [ChartSeries(values: h.map(\.down), color: .accentDL),
+                                             ChartSeries(values: h.map(\.up), color: .accentUL)],
+                                    fmt: { fmtRate(Double($0)) + "B/s" },
+                                    scrub: scrub, minTop: 50_000)
+                        MetricChart(label: "PING",
+                                    series: [ChartSeries(values: h.map(\.ping), color: .accentPing)],
+                                    fmt: { String(format: "%.0f ms", $0) },
+                                    scrub: scrub, minTop: 50)
+                        MetricChart(label: "CPU",
+                                    series: [ChartSeries(values: h.map(\.cpu), color: .accentRPM)],
+                                    fmt: { String(format: "%.0f%%", $0) },
+                                    scrub: scrub, fixedTop: 100)
+                        MetricChart(label: "MEMORY",
+                                    series: [ChartSeries(values: h.map(\.ram), color: .accentMid)],
+                                    fmt: { String(format: "%.0f%%", $0) },
+                                    scrub: scrub, fixedTop: 100)
+                    }
+                    .contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        switch phase {
+                        case .active(let pt):
+                            guard geo.size.width > 0, h.count > 1 else { return }
+                            let frac = min(max(pt.x / geo.size.width, 0), 1)
+                            scrub = Int((frac * CGFloat(h.count - 1)).rounded())
+                        case .ended:
+                            scrub = nil
+                        }
+                    }
+                }
+                .frame(height: 176)
+            }
+        }
+    }
+
+    private func stampText(_ h: [Sample]) -> String {
+        guard let first = h.first, let last = h.last else { return "—" }
+        if let scrub, h.indices.contains(scrub) {
+            let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+            let ago = Int(last.t.timeIntervalSince(h[scrub].t).rounded())
+            return ago < 5 ? "now · \(f.string(from: h[scrub].t))"
+                           : "\(ago / 60 > 0 ? "\(ago / 60)m " : "")\(ago % 60)s ago · \(f.string(from: h[scrub].t))"
+        }
+        let span = Int(last.t.timeIntervalSince(first.t) / 60)
+        return span < 1 ? "hover to scrub" : "\(span) min · hover to scrub"
+    }
 }
 
 // MARK: - Live monitor card (always visible in the popover)
@@ -1220,7 +1465,7 @@ struct LiveStrip: View {
                 sectionLabel("LIVE", color: .accentRPM)
                 Spacer()
                 Text("\(monitor.netName) (\(monitor.iface.isEmpty ? "—" : monitor.iface))")
-                    .font(.system(size: 9))
+                    .font(.system(size: 9.5))
                     .foregroundStyle(Color.dimText)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -1235,61 +1480,38 @@ struct LiveStrip: View {
                 .foregroundStyle(Color.dimText)
                 .lineLimit(1)
                 .truncationMode(.middle)
-            if !monitor.topApps.isEmpty {
-                Text("top: " + monitor.topApps.map { "\($0.name) \(fmtRate($0.bps))" }.joined(separator: " · "))
-                    .font(.system(size: 9.5).monospacedDigit())
-                    .foregroundStyle(Color.dimText)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
+            Text(topLine)
+                .font(.system(size: 9.5).monospacedDigit())
+                .foregroundStyle(Color.dimText)
+                .lineLimit(1)
+                .truncationMode(.tail)
         }
     }
 
+    // Fixed-width value slot so the row never re-centers as digits change.
     private func rateCol(icon: String, color: Color, value: String) -> some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 5) {
             Image(systemName: icon).font(.system(size: 9, weight: .heavy)).foregroundStyle(color)
             Text(value)
                 .font(.system(size: 13, weight: .semibold, design: .rounded).monospacedDigit())
                 .foregroundStyle(.white)
                 .contentTransition(.numericText())
+                .frame(width: 84, alignment: .leading)
         }
         .frame(maxWidth: .infinity)
         .animation(.default, value: value)
+    }
+
+    private var topLine: String {
+        monitor.topApps.isEmpty
+            ? "top: —"
+            : "top: " + monitor.topApps.map { "\($0.name) \(fmtRate($0.bps))" }.joined(separator: " · ")
     }
 
     private var detailLine: String {
         let gw = monitor.gwPingMs.map { String(format: "%.1f ms", $0) } ?? "—"
         let net = monitor.inetPingMs.map { String(format: "%.0f ms", $0) } ?? "—"
         return "gw \(gw) · net \(net) · today ↓\(fmtBytes(monitor.todayDown)) ↑\(fmtBytes(monitor.todayUp))"
-    }
-}
-
-// MARK: - Live stats (while a test is running)
-
-struct LiveStatsView: View {
-    @ObservedObject var model: SpeedTestModel
-
-    var body: some View {
-        HStack(spacing: 0) {
-            stat(icon: "clock", color: .accentPing, label: "PING",
-                 value: model.livePing.map { fmtLatency($0) } ?? "…")
-            Rectangle().fill(Color.faintLine).frame(width: 1, height: 30)
-            stat(icon: "waveform.path.ecg", color: .accentRPM, label: "JITTER",
-                 value: model.liveJitter.map { fmtLatency($0) } ?? "…")
-        }
-    }
-
-    private func stat(icon: String, color: Color, label: String, value: String) -> some View {
-        VStack(spacing: 3) {
-            HStack(spacing: 4) {
-                Image(systemName: icon).font(.system(size: 9, weight: .bold)).foregroundStyle(color)
-                Text(label).font(.system(size: 8.5, weight: .semibold)).tracking(0.7).foregroundStyle(Color.dimText)
-            }
-            Text(value)
-                .font(.system(size: 14, weight: .semibold, design: .rounded).monospacedDigit())
-                .foregroundStyle(.white)
-        }
-        .frame(maxWidth: .infinity)
     }
 }
 

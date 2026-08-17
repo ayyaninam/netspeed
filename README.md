@@ -47,6 +47,7 @@ A speedtest.net-style internet speed test that lives in your macOS menu bar. One
 - **Always-on live monitor in the menu bar** — your Mac's actual ↓/↑ throughput stacked in two tiny rows, each with a colored 4-bar utilization meter, plus internet ping in a small side column. Speeds update every second, ping every 5 s. Three display modes in the gear menu (speeds + ping / speeds only / icon only).
 - **The bars mean something** — they show how full your pipe is relative to *your measured line speed* (last test): cyan/purple while normal, **amber past 60%, red when saturated**. Ink flips automatically for light/dark menu bars.
 - **LIVE card in the popover** — current rates, gateway ping vs internet ping, network name + interface, today's data totals, and the top 3 apps using the connection right now. Test results live in their own LAST TEST card below it.
+- **One hour of history, four synced charts** — network (↓/↑ overlaid), ping, CPU, and memory, always on screen. Hover anywhere to scrub: a single vertical line moves across **all four** charts at once and every value updates to that moment, so you can see whether a ping spike lined up with a download, a CPU pileup, or memory pressure.
 - **CSV logs that answer "when was it bad and why"** — one row every 10 s: throughput, both pings, network name, interface, top app. Gear → "Open logs folder".
 - **Menu bar citizen** — no Dock icon, last result persists across restarts, optional Launch at Login, Stop button mid-test.
 - **Self-archiving** — the installed app embeds its own source code (`NetSpeed.app/Contents/Resources/`), so any installed copy can rebuild itself.
@@ -128,6 +129,21 @@ Run Apple's built-in `networkquality` and you may see an "idle latency" 20–50�
 | Answers | "How good is my line?" | "How do far-away servers feel through my line?" |
 
 NetSpeed reports the speedtest.net-style number because that's what isolates *your line and ISP* from the rest of the internet.
+
+## The history charts
+
+| | |
+|---|---|
+| History | 720 samples at 5 s = exactly 1 hour, held in a ring buffer (~20 KB). Not persisted — it starts filling when the app launches |
+| Charts | Network ↓/↑, ping, CPU, memory. Drawn as plain SwiftUI `Path`s rather than Swift Charts, because four 720-point charts need to stay cheap |
+| Scrubbing | Hover moves one shared cursor across all four charts; each header shows that instant's value, and the card header shows how long ago it was |
+| CPU | `host_statistics(HOST_CPU_LOAD_INFO)` tick deltas — no `top`, no subprocess |
+| Memory | `host_statistics64(HOST_VM_INFO64)`: active + wired + compressed over physical RAM, matching Activity Monitor's "Memory Used" |
+| Cost | Charts render only while the popover is open. Idle CPU stays ~0.1–0.4% |
+
+### Why the popover never resizes
+
+A `MenuBarExtra(.window)` panel **dismisses itself when its content changes height** — so anything that appears, disappears, or expands will close the window under the user's cursor. Every section here therefore renders at a constant height in every state: the status line is always present (only its text changes), the charts reserve their full height while still collecting, and the LAST TEST card always renders its full shape, showing dashes and "no test yet" before the first run. If you add a section, give it a fixed height or the popover will start closing on people.
 
 ## Live monitor & logs
 
