@@ -310,8 +310,51 @@ final class SysSampler {
     }
 }
 
+// MARK: - Per-app usage
+// nettop reports the executable name truncated to 15 chars, which turns
+// "Microsoft Update Assistant" into "Microsoft Updat" and Warp into "stable"
+// (its binary is literally Contents/MacOS/stable). So we keep the pid instead
+// and resolve a real name + icon from it.
+
+struct AppUsage: Identifiable {
+    let id: Int32          // pid
+    let name: String
+    let icon: NSImage?
+    let down: Double
+    let up: Double
+    var total: Double { down + up }
+}
+
+@MainActor
+final class AppNameResolver {
+    private var cache: [Int32: (String, NSImage?)] = [:]
+
+    func resolve(_ pid: Int32) -> (name: String, icon: NSImage?) {
+        if let hit = cache[pid] { return hit }
+        var out: (String, NSImage?) = ("pid \(pid)", nil)
+        if let app = NSRunningApplication(processIdentifier: pid), let n = app.localizedName {
+            out = (n, app.icon)
+        } else {
+            var buf = [CChar](repeating: 0, count: 4096)
+            if proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 {
+                let path = String(cString: buf)
+                if let r = path.range(of: ".app/", options: .backwards) {
+                    let bundle = String(path[..<r.lowerBound]) + ".app"
+                    out = ((bundle as NSString).lastPathComponent.replacingOccurrences(of: ".app", with: ""),
+                           NSWorkspace.shared.icon(forFile: bundle))
+                } else {
+                    out = ((path as NSString).lastPathComponent, nil)
+                }
+            }
+        }
+        if cache.count > 300 { cache.removeAll() }   // pids get recycled; keep it bounded
+        cache[pid] = out
+        return out
+    }
+}
+
 // One point of history. Float keeps the hour's ring at ~20 KB.
-struct Sample {
+struct Sample: Equatable {
     let t: Date
     let down: Float
     let up: Float
@@ -336,7 +379,7 @@ final class NetMonitor: ObservableObject {
     @Published var iface: String = ""
     @Published var todayDown: UInt64 = 0
     @Published var todayUp: UInt64 = 0
-    @Published var topApps: [(name: String, bps: Double)] = []
+    @Published var topApps: [AppUsage] = []
     @Published var cpuPct: Float = 0
     @Published var ramPct: Float = 0
     @Published private(set) var history: [Sample] = []
@@ -351,11 +394,12 @@ final class NetMonitor: ObservableObject {
     private var lastSampleAt: Date?
     private var tickCount = 0
     private var gateway: String?
-    private var lastNettop: [String: (UInt64, UInt64)] = [:]
+    private var lastNettop: [Int32: (UInt64, UInt64)] = [:]
     private var lastNettopAt: Date?
     private var dayKey = ""
     private let sys = SysSampler()
     private var lastGoodPing: Float = 0
+    private let names = AppNameResolver()
 
     init() {
         logDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -379,10 +423,10 @@ final class NetMonitor: ObservableObject {
             if let gw = gateway { pingOnce(gw, into: \.gwPingMs) }
             pingOnce("1.1.1.1", into: \.inetPingMs)
             recordHistory()
+            sampleTopApps()
         }
         if tickCount % 10 == 1 {         // every 10 s
             refreshPrimary()
-            sampleTopApps()
             appendLog()
             persistToday()
         }
@@ -491,7 +535,7 @@ final class NetMonitor: ObservableObject {
     // MARK: per-app usage (nettop deltas; skipped while the line is idle)
 
     private func sampleTopApps() {
-        guard downBps + upBps > 50_000 else {
+        guard downBps + upBps > 20_000 else {
             topApps = []; lastNettop = [:]; lastNettopAt = nil
             return
         }
@@ -506,37 +550,39 @@ final class NetMonitor: ObservableObject {
             guard (try? p.run()) != nil else { return }
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             p.waitUntilExit()
-            var current: [String: (UInt64, UInt64)] = [:]
+            var current: [Int32: (UInt64, UInt64)] = [:]
             for line in String(decoding: data, as: UTF8.self).split(separator: "\n").dropFirst() {
                 let parts = line.split(separator: " ", omittingEmptySubsequences: true)
                 guard parts.count >= 3,
                       let bin = UInt64(parts[parts.count - 2]),
                       let bout = UInt64(parts[parts.count - 1]) else { continue }
-                var name = parts[0..<(parts.count - 2)].joined(separator: " ")
-                if let dot = name.lastIndex(of: "."),
-                   name[name.index(after: dot)...].allSatisfy(\.isNumber) {
-                    name = String(name[..<dot])
-                }
-                let prev = current[name] ?? (0, 0)
-                current[name] = (prev.0 + bin, prev.1 + bout)
+                // Trailing ".<pid>" on the (possibly space-containing) name column.
+                let token = parts[0..<(parts.count - 2)].joined(separator: " ")
+                guard let dot = token.lastIndex(of: "."),
+                      let pid = Int32(token[token.index(after: dot)...]) else { continue }
+                let prev = current[pid] ?? (0, 0)
+                current[pid] = (prev.0 + bin, prev.1 + bout)
             }
             await MainActor.run { [weak self] in self?.digestNettop(current) }
         }
     }
 
-    private func digestNettop(_ current: [String: (UInt64, UInt64)]) {
+    private func digestNettop(_ current: [Int32: (UInt64, UInt64)]) {
         let now = Date()
         defer { lastNettop = current; lastNettopAt = now }
         guard let t = lastNettopAt, !lastNettop.isEmpty else { return }
         let dt = now.timeIntervalSince(t)
         guard dt > 1 else { return }
-        var rates: [(String, Double)] = []
-        for (name, cur) in current {
-            guard let prev = lastNettop[name], cur.0 >= prev.0, cur.1 >= prev.1 else { continue }
-            let bps = Double((cur.0 - prev.0) + (cur.1 - prev.1)) / dt
-            if bps > 10_000 { rates.append((name, bps)) }
+        var rows: [AppUsage] = []
+        for (pid, cur) in current {
+            guard let prev = lastNettop[pid], cur.0 >= prev.0, cur.1 >= prev.1 else { continue }
+            let down = Double(cur.0 - prev.0) / dt
+            let up = Double(cur.1 - prev.1) / dt
+            guard down + up > 5_000 else { continue }
+            let info = names.resolve(pid)
+            rows.append(AppUsage(id: pid, name: info.name, icon: info.icon, down: down, up: up))
         }
-        topApps = rates.sorted { $0.1 > $1.1 }.prefix(3).map { (name: $0.0, bps: $0.1) }
+        topApps = Array(rows.sorted { $0.total > $1.total }.prefix(3))
     }
 
     // MARK: daily totals
@@ -659,8 +705,22 @@ private func meterColor(level: Int, accent: NSColor) -> NSColor {
     }
 }
 
+// Re-rasterising the label every second costs real CPU, and while the line is
+// idle nothing in it actually changes — so cache on the rendered content.
+@MainActor
+private var menuBarImageKey = ""
+@MainActor
+private var menuBarImageCached: NSImage?
+
+@MainActor
 func menuBarStatusImage(down: Double, up: Double, ping: Double?, showPing: Bool,
                         capDownMbps: Double?, capUpMbps: Double?) -> NSImage {
+    let key = [fmtRate(down), fmtRate(up),
+               showPing ? (ping.map { String(Int($0.rounded())) } ?? "—") : "",
+               String(meterLevel(down, capacityMbps: capDownMbps)),
+               String(meterLevel(up, capacityMbps: capUpMbps))].joined(separator: "|")
+    if key == menuBarImageKey, let cached = menuBarImageCached { return cached }
+
     let textW: CGFloat = 33
     let barsX = textW + 2
     let barsW: CGFloat = 4 * 4.5
@@ -709,6 +769,8 @@ func menuBarStatusImage(down: Double, up: Double, ping: Double?, showPing: Bool,
         return true
     }
     image.isTemplate = false
+    menuBarImageKey = key
+    menuBarImageCached = image
     return image
 }
 
@@ -783,7 +845,7 @@ struct ContentView: View {
             .frame(height: 206)
             StatusLine(model: model)
             VStack(spacing: 8) {
-                HistoryPanel(monitor: monitor)
+                HistoryPanel(history: monitor.history).equatable()
                 LiveStrip(monitor: monitor)
                 ResultDetailsView(result: model.lastResult)
             }
@@ -1383,12 +1445,16 @@ struct MetricChart: View {
     }
 }
 
-struct HistoryPanel: View {
-    @ObservedObject var monitor: NetMonitor
+// Takes history by value and is Equatable, so SwiftUI skips rebuilding four
+// 720-point Paths on the 1 Hz live-rate updates — history only changes every 5 s.
+struct HistoryPanel: View, Equatable {
+    let history: [Sample]
     @State private var scrub: Int?
 
+    static func == (a: HistoryPanel, b: HistoryPanel) -> Bool { a.history == b.history }
+
     var body: some View {
-        let h = monitor.history
+        let h = history
         SectionCard {
             HStack {
                 sectionLabel("LAST HOUR", color: .accentRPM)
@@ -1454,6 +1520,66 @@ struct HistoryPanel: View {
     }
 }
 
+// MARK: - Top apps by current throughput
+// Always three rows (blank ones included) — the popover must not change height.
+
+struct TopAppsView: View, Equatable {
+    let apps: [AppUsage]
+
+    // Icons are immutable per pid, so identity + rates fully describe a row.
+    static func == (a: TopAppsView, b: TopAppsView) -> Bool {
+        a.apps.count == b.apps.count
+            && zip(a.apps, b.apps).allSatisfy { $0.id == $1.id && $0.down == $1.down && $0.up == $1.up }
+    }
+
+    private var peak: Double { max(apps.first?.total ?? 1, 1) }
+
+    var body: some View {
+        VStack(spacing: 3) {
+            ForEach(0..<3, id: \.self) { i in
+                row(i < apps.count ? apps[i] : nil)
+            }
+        }
+    }
+
+    private func row(_ app: AppUsage?) -> some View {
+        ZStack(alignment: .leading) {
+            GeometryReader { geo in
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color.accentDL.opacity(0.15))
+                    .frame(width: app.map { geo.size.width * CGFloat(min($0.total / peak, 1)) } ?? 0)
+            }
+            HStack(spacing: 5) {
+                if let icon = app?.icon {
+                    Image(nsImage: icon).resizable().frame(width: 12, height: 12)
+                } else {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.white.opacity(0.06))
+                        .frame(width: 12, height: 12)
+                }
+                Text(app?.name ?? "—")
+                    .font(.system(size: 10))
+                    .foregroundStyle(app == nil ? Color.dimText : .white.opacity(0.9))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 4)
+                if let app {
+                    Text("↓" + fmtRate(app.down))
+                        .font(.system(size: 9.5, weight: .medium).monospacedDigit())
+                        .foregroundStyle(Color.accentDL)
+                        .frame(width: 40, alignment: .trailing)
+                    Text("↑" + fmtRate(app.up))
+                        .font(.system(size: 9.5, weight: .medium).monospacedDigit())
+                        .foregroundStyle(Color.accentUL)
+                        .frame(width: 40, alignment: .trailing)
+                }
+            }
+            .padding(.horizontal, 4)
+        }
+        .frame(height: 17)
+    }
+}
+
 // MARK: - Live monitor card (always visible in the popover)
 
 struct LiveStrip: View {
@@ -1480,11 +1606,8 @@ struct LiveStrip: View {
                 .foregroundStyle(Color.dimText)
                 .lineLimit(1)
                 .truncationMode(.middle)
-            Text(topLine)
-                .font(.system(size: 9.5).monospacedDigit())
-                .foregroundStyle(Color.dimText)
-                .lineLimit(1)
-                .truncationMode(.tail)
+            Rectangle().fill(Color.white.opacity(0.05)).frame(height: 1)
+            TopAppsView(apps: monitor.topApps).equatable()
         }
     }
 
@@ -1502,11 +1625,6 @@ struct LiveStrip: View {
         .animation(.default, value: value)
     }
 
-    private var topLine: String {
-        monitor.topApps.isEmpty
-            ? "top: —"
-            : "top: " + monitor.topApps.map { "\($0.name) \(fmtRate($0.bps))" }.joined(separator: " · ")
-    }
 
     private var detailLine: String {
         let gw = monitor.gwPingMs.map { String(format: "%.1f ms", $0) } ?? "—"
