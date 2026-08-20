@@ -379,12 +379,14 @@ final class NetMonitor: ObservableObject {
     @Published var iface: String = ""
     @Published var todayDown: UInt64 = 0
     @Published var todayUp: UInt64 = 0
+    @Published var dailyTotals: [String: [Double]] = [:]   // "yyyy-MM-dd" -> [down, up]
     @Published var topApps: [AppUsage] = []
     @Published var cpuPct: Float = 0
     @Published var ramPct: Float = 0
     @Published private(set) var history: [Sample] = []
 
     static let historyCap = 720          // 720 × 5 s = 1 hour
+    static let dailyKey = "dailyTotals"  // 31 days of per-day byte totals
 
     let logDir: URL
 
@@ -450,20 +452,30 @@ final class NetMonitor: ObservableObject {
     private func sampleCounters() {
         guard !iface.isEmpty, let (inB, outB) = Self.linkBytes(iface) else { return }
         let now = Date()
-        if let li = lastIn, let lo = lastOut, let t = lastSampleAt {
-            let dt = now.timeIntervalSince(t)
-            let din = UInt64(inB &- li)
-            let dout = UInt64(outB &- lo)
-            // 1 GB per tick ≈ counter reset or interface flap — skip the sample.
-            if dt > 0.5, din < 1_000_000_000, dout < 1_000_000_000 {
-                downBps = Double(din) / dt
-                upBps = Double(dout) / dt
-                rollDayIfNeeded()
-                todayDown += din
-                todayUp += dout
-            }
+        defer { lastIn = inB; lastOut = outB; lastSampleAt = now }
+        guard let li = lastIn, let lo = lastOut, let t = lastSampleAt else { return }
+        let dt = now.timeIntervalSince(t)
+        guard dt > 0.5,
+              let din = Self.counterDelta(prev: li, now: inB),
+              let dout = Self.counterDelta(prev: lo, now: outB) else { return }
+        downBps = Double(din) / dt
+        upBps = Double(dout) / dt
+        rollDayIfNeeded()
+        todayDown += din
+        todayUp += dout
+    }
+
+    // if_data counters are 32-bit. Going backwards is a genuine wrap only when
+    // the previous value sat near the ceiling; otherwise the interface was
+    // reset (adapter unplugged, Wi-Fi reconnected) and the "delta" is phantom
+    // traffic — up to ~4 GB of it — that must not land in the daily totals.
+    private static func counterDelta(prev: UInt32, now: UInt32) -> UInt64? {
+        if now >= prev {
+            let d = UInt64(now - prev)
+            return d < 2_000_000_000 ? d : nil
         }
-        lastIn = inB; lastOut = outB; lastSampleAt = now
+        guard prev > 3_500_000_000 else { return nil }
+        return UInt64(now &- prev)
     }
 
     private static func linkBytes(_ name: String) -> (UInt32, UInt32)? {
@@ -598,6 +610,9 @@ final class NetMonitor: ObservableObject {
 
     private func restoreToday() {
         let d = UserDefaults.standard
+        if let raw = d.dictionary(forKey: Self.dailyKey) as? [String: [Double]] {
+            dailyTotals = raw
+        }
         if d.string(forKey: "todayKey") == dayKey {
             todayDown = UInt64(d.double(forKey: "todayDown"))
             todayUp = UInt64(d.double(forKey: "todayUp"))
@@ -609,6 +624,41 @@ final class NetMonitor: ObservableObject {
         d.set(dayKey, forKey: "todayKey")
         d.set(Double(todayDown), forKey: "todayDown")
         d.set(Double(todayUp), forKey: "todayUp")
+        dailyTotals[dayKey] = [Double(todayDown), Double(todayUp)]
+        if dailyTotals.count > 40 {
+            let keep = Set(dailyTotals.keys.sorted().suffix(31))
+            dailyTotals = dailyTotals.filter { keep.contains($0.key) }
+        }
+        d.set(dailyTotals, forKey: Self.dailyKey)
+    }
+
+    // MARK: week / month roll-ups
+
+    private func sumDays(_ keys: Set<String>) -> (down: UInt64, up: UInt64) {
+        var down = 0.0, up = 0.0
+        for (day, v) in dailyTotals where keys.contains(day) && v.count == 2 {
+            down += v[0]; up += v[1]
+        }
+        return (UInt64(down), UInt64(up))
+    }
+
+    var monthToDate: (down: UInt64, up: UInt64) {
+        let prefix = String(dayKey.prefix(7))                    // "yyyy-MM"
+        return sumDays(Set(dailyTotals.keys.filter { $0.hasPrefix(prefix) }))
+    }
+
+    var weekToDate: (down: UInt64, up: UInt64) {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        let days = (0..<7).compactMap {
+            Calendar.current.date(byAdding: .day, value: -$0, to: Date())
+        }.map { f.string(from: $0) }
+        return sumDays(Set(days))
+    }
+
+    // Days actually recorded this month — makes a partial history honest.
+    var monthDaysCovered: Int {
+        let prefix = String(dayKey.prefix(7))
+        return dailyTotals.keys.filter { $0.hasPrefix(prefix) }.count
     }
 
     // MARK: CSV log
@@ -1606,6 +1656,11 @@ struct LiveStrip: View {
                 .foregroundStyle(Color.dimText)
                 .lineLimit(1)
                 .truncationMode(.middle)
+            Text(usageLine)
+                .font(.system(size: 9.5).monospacedDigit())
+                .foregroundStyle(Color.dimText)
+                .lineLimit(1)
+                .truncationMode(.middle)
             Rectangle().fill(Color.white.opacity(0.05)).frame(height: 1)
             TopAppsView(apps: monitor.topApps).equatable()
         }
@@ -1630,6 +1685,13 @@ struct LiveStrip: View {
         let gw = monitor.gwPingMs.map { String(format: "%.1f ms", $0) } ?? "—"
         let net = monitor.inetPingMs.map { String(format: "%.0f ms", $0) } ?? "—"
         return "gw \(gw) · net \(net) · today ↓\(fmtBytes(monitor.todayDown)) ↑\(fmtBytes(monitor.todayUp))"
+    }
+
+    private var usageLine: String {
+        let w = monitor.weekToDate
+        let m = monitor.monthToDate
+        let days = monitor.monthDaysCovered
+        return "week ↓\(fmtBytes(w.down)) ↑\(fmtBytes(w.up)) · month ↓\(fmtBytes(m.down)) ↑\(fmtBytes(m.up)) (\(days)d)"
     }
 }
 
