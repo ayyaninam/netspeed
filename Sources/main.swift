@@ -363,6 +363,291 @@ struct Sample: Equatable {
     let ram: Float
 }
 
+// MARK: - Keychain (radio credentials never live in source or defaults)
+
+enum Keychain {
+    static let service = "com.ayyan.netspeed"
+
+    static func get(_ account: String) -> String? {
+        let q: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                kSecAttrService as String: service,
+                                kSecAttrAccount as String: account,
+                                kSecReturnData as String: true,
+                                kSecMatchLimit as String: kSecMatchLimitOne]
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+              let d = out as? Data else { return nil }
+        return String(data: d, encoding: .utf8)
+    }
+
+    static func set(_ value: String, account: String) {
+        let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                   kSecAttrService as String: service,
+                                   kSecAttrAccount as String: account]
+        SecItemDelete(base as CFDictionary)
+        var add = base
+        add[kSecValueData as String] = Data(value.utf8)
+        SecItemAdd(add as CFDictionary, nil)
+    }
+}
+
+// MARK: - Radio (Ubiquiti airOS) telemetry
+// Schema verified live against a PowerBeam M5-400 on airOS v6.3.24:
+// status.cgi -> host.{uptime,cpuload,devmodel,fwversion}
+//               wireless.{signal,noisef,ccq,txrate,rxrate,txpower,essid,
+//                         frequency,distance,chainrssi,polling.{quality,capacity}}
+
+struct RadioStatus: Equatable {
+    var model = "", essid = "", freq = "", fw = ""
+    var signal = 0, noise = 0, txPower = 0
+    var ccq = 0                  // per-mille in airOS
+    var amq = 0, amc = 0         // airMAX quality / capacity, %
+    var txRate = "", rxRate = ""
+    var uptime = 0, distance = 0, ethSpeed = 0
+    var cpu = 0.0
+    var chains: [Int] = []
+    var snr: Int { signal - noise }
+    var chainSpread: Int { (chains.max() ?? 0) - (chains.min() ?? 0) }
+}
+
+struct RadioSample: Equatable {
+    let t: Date
+    let signal: Float
+    let amc: Float
+    let ccq: Float
+}
+
+@MainActor
+final class RadioMonitor: ObservableObject {
+    @Published var status: RadioStatus?
+    @Published var error: String?
+    @Published var host: String { didSet { UserDefaults.standard.set(host, forKey: "radioHost") } }
+    @Published var user: String { didSet { UserDefaults.standard.set(user, forKey: "radioUser") } }
+    @Published private(set) var history: [RadioSample] = []
+
+    // status.cgi is expensive on an M-series radio (its CPU has been seen at
+    // 94%), so poll gently — 60 s still gives an hour of history.
+    static let cap = 60          // 60 × 60 s = 1 hour
+
+    private var timer: Timer?
+    private var cookie: String?
+    private var busy = false
+
+    var configured: Bool { !host.isEmpty && !user.isEmpty && Keychain.get("radioPassword") != nil }
+
+    init() {
+        host = UserDefaults.standard.string(forKey: "radioHost") ?? ""
+        user = UserDefaults.standard.string(forKey: "radioUser") ?? ""
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refresh() }
+        }
+        timer?.tolerance = 10
+        refresh()
+    }
+
+    func savePassword(_ p: String) {
+        Keychain.set(p, account: "radioPassword")
+        cookie = nil
+        refresh()
+    }
+
+    func refresh() {
+        guard configured, !busy else { return }
+        busy = true
+        let h = host, u = user
+        guard let pw = Keychain.get("radioPassword") else { busy = false; return }
+        Task { [weak self] in
+            let result = await Self.fetch(host: h, user: u, password: pw)
+            await MainActor.run {
+                guard let self else { return }
+                self.busy = false
+                switch result {
+                case .success(let s):
+                    self.status = s
+                    self.error = nil
+                    self.history.append(RadioSample(t: Date(), signal: Float(s.signal),
+                                                    amc: Float(s.amc), ccq: Float(s.ccq) / 10))
+                    if self.history.count > Self.cap {
+                        self.history.removeFirst(self.history.count - Self.cap)
+                    }
+                case .failure(let e):
+                    self.error = e.message
+                }
+            }
+        }
+    }
+
+    // airOS wants a session cookie from login.cgi before status.cgi will answer.
+    nonisolated private static func fetch(host: String, user: String, password: String) async -> Result<RadioStatus, RadioError> {
+        let cfg = URLSessionConfiguration.ephemeral   // isolated cookie jar per fetch
+        cfg.timeoutIntervalForRequest = 8
+        cfg.httpShouldSetCookies = true
+        let session = URLSession(configuration: cfg)
+        guard let seed = URL(string: "http://\(host)/login.cgi?uri=/"),
+              let loginURL = URL(string: "http://\(host)/login.cgi"),
+              let statusURL = URL(string: "http://\(host)/status.cgi") else {
+            return .failure(RadioError("bad host"))
+        }
+        do {
+            _ = try await session.data(from: seed)
+            var req = URLRequest(url: loginURL)
+            req.httpMethod = "POST"
+            req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+            let esc = CharacterSet.alphanumerics
+            let body = "username=\(user.addingPercentEncoding(withAllowedCharacters: esc) ?? user)"
+                + "&password=\(password.addingPercentEncoding(withAllowedCharacters: esc) ?? password)&uri=/"
+            req.httpBody = Data(body.utf8)
+            _ = try await session.data(for: req)
+            let (data, _) = try await session.data(from: statusURL)
+            guard let j = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let h = j["host"] as? [String: Any],
+                  let w = j["wireless"] as? [String: Any] else {
+                return .failure(RadioError("login rejected or unexpected response"))
+            }
+            var s = RadioStatus()
+            s.model = h["devmodel"] as? String ?? ""
+            s.fw = h["fwversion"] as? String ?? ""
+            s.uptime = h["uptime"] as? Int ?? 0
+            s.cpu = h["cpuload"] as? Double ?? 0
+            s.essid = w["essid"] as? String ?? ""
+            s.freq = w["frequency"] as? String ?? ""
+            s.signal = w["signal"] as? Int ?? 0
+            s.noise = w["noisef"] as? Int ?? 0
+            s.ccq = w["ccq"] as? Int ?? 0
+            s.txPower = w["txpower"] as? Int ?? 0
+            s.txRate = "\(w["txrate"] ?? "")"
+            s.rxRate = "\(w["rxrate"] ?? "")"
+            s.distance = w["distance"] as? Int ?? 0
+            s.chains = (w["chainrssi"] as? [Int])?.filter { $0 > 0 } ?? []
+            if let p = w["polling"] as? [String: Any] {
+                s.amq = p["quality"] as? Int ?? 0
+                s.amc = p["capacity"] as? Int ?? 0
+            }
+            if let ifs = j["interfaces"] as? [[String: Any]],
+               let eth = ifs.first(where: { ($0["ifname"] as? String) == "eth0" }),
+               let st = (eth["status"] as? [[String: Any]])?.first {
+                s.ethSpeed = st["speed"] as? Int ?? 0
+            }
+            return .success(s)
+        } catch {
+            return .failure(RadioError(error.localizedDescription))
+        }
+    }
+}
+
+struct RadioError: Error {
+    let message: String
+    init(_ m: String) { message = m }
+}
+
+// MARK: - LAN devices
+// A switched network hides other hosts' traffic from us, and the router exposes
+// no per-client counters — so this lists WHO is present, never how much they use.
+
+struct LanDevice: Identifiable, Equatable {
+    let id: String        // MAC
+    let ip: String
+    let vendor: String
+    let isGateway: Bool
+    let isSelf: Bool
+}
+
+@MainActor
+final class DeviceScanner: ObservableObject {
+    @Published private(set) var devices: [LanDevice] = []
+    @Published private(set) var scannedAt: Date?
+
+    private var timer: Timer?
+
+    private static let ouis: [String: String] = [
+        "50:0F:F5": "Tenda", "E4:38:83": "Ubiquiti", "24:A4:3C": "Ubiquiti",
+        "78:8A:20": "Ubiquiti", "DC:9F:DB": "Ubiquiti", "04:18:D6": "Ubiquiti",
+        "98:EE:CB": "USB Ethernet", "AC:DE:48": "Apple", "F0:18:98": "Apple",
+        "A4:83:E7": "Apple", "3C:22:FB": "Apple", "F4:D4:88": "Apple",
+        "8C:85:90": "Apple", "BC:D0:74": "Apple", "D0:81:7A": "Apple",
+        "50:ED:3C": "Apple", "14:7D:DA": "Apple", "C0:2C:5C": "Apple",
+        "50:8F:4C": "Xiaomi", "64:CC:2E": "Xiaomi", "2C:F0:5D": "Micro-Star",
+        "B0:BE:76": "TP-Link", "50:C7:BF": "TP-Link", "AC:84:C6": "TP-Link",
+        "00:1A:11": "Google", "F8:0F:F9": "Google", "DA:A1:19": "Google",
+        "1C:6A:1B": "Ubiquiti", "00:E0:4C": "Realtek", "5C:E9:1E": "Samsung",
+        "C8:D0:83": "Huawei", "48:5F:99": "Cloud Network",
+    ]
+
+    init() {
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.scan() }
+        }
+        timer?.tolerance = 10
+        scan()
+    }
+
+    func scan() {
+        Task.detached(priority: .utility) {
+            // One multicast ping makes live hosts answer, which populates the
+            // ARP cache — far cheaper than sweeping 254 addresses.
+            _ = try? await Self.run("/sbin/ping", ["-c", "2", "-t", "2", "224.0.0.1"])
+            let arp = (try? await Self.run("/usr/sbin/arp", ["-an"])) ?? ""
+            let gw = (try? await Self.run("/sbin/route", ["-n", "get", "default"])) ?? ""
+            let gateway = gw.split(separator: "\n")
+                .first { $0.contains("gateway:") }?
+                .split(separator: ":").last.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+            let mine = Set((try? await Self.run("/sbin/ifconfig", []))?
+                .split(separator: "\n")
+                .filter { $0.contains("inet ") }
+                .compactMap { $0.split(separator: " ").dropFirst().first.map(String.init) } ?? [])
+            let parsed = Self.parse(arp, gateway: gateway, mine: mine)
+            await MainActor.run { [weak self] in
+                self?.devices = parsed
+                self?.scannedAt = Date()
+            }
+        }
+    }
+
+    // "? (192.168.0.1) at 50:f:f5:52:55:e8 on en9 ifscope [ethernet]"
+    nonisolated private static func parse(_ text: String, gateway: String, mine: Set<String>) -> [LanDevice] {
+        var out: [LanDevice] = []
+        var seen = Set<String>()
+        for line in text.split(separator: "\n") {
+            guard let ipStart = line.firstIndex(of: "("),
+                  let ipEnd = line.firstIndex(of: ")"), ipStart < ipEnd else { continue }
+            let ip = String(line[line.index(after: ipStart)..<ipEnd])
+            let parts = line.split(separator: " ")
+            guard let atIdx = parts.firstIndex(of: "at"), parts.count > atIdx + 1 else { continue }
+            let raw = String(parts[atIdx + 1])
+            guard raw.contains(":") else { continue }
+            let mac = raw.split(separator: ":")
+                .map { $0.count == 1 ? "0" + $0 : String($0) }
+                .joined(separator: ":").uppercased()
+            guard mac != "FF:FF:FF:FF:FF:FF", !mac.hasPrefix("01:00:5E"), !seen.contains(mac) else { continue }
+            seen.insert(mac)
+            let oui = mac.split(separator: ":").prefix(3).joined(separator: ":")
+            out.append(LanDevice(id: mac, ip: ip, vendor: ouis[oui] ?? "—",
+                                 isGateway: ip == gateway, isSelf: mine.contains(ip)))
+        }
+        return out.sorted {
+            if $0.isGateway != $1.isGateway { return $0.isGateway }
+            return Self.ipKey($0.ip) < Self.ipKey($1.ip)
+        }
+    }
+
+    nonisolated private static func ipKey(_ ip: String) -> UInt32 {
+        ip.split(separator: ".").reduce(UInt32(0)) { ($0 << 8) | (UInt32($1) ?? 0) }
+    }
+
+    private static func run(_ path: String, _ args: [String]) async throws -> String {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        try p.run()
+        let d = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return String(decoding: d, as: UTF8.self)
+    }
+}
+
 // MARK: - Live network monitor
 // Lightweight by design: a 2 s byte-counter poll (getifaddrs syscall, no
 // subprocess), pings + CSV log every 10 s, and per-app sampling (nettop)
@@ -844,10 +1129,12 @@ extension Color {
 struct NetSpeedApp: App {
     @StateObject private var model = SpeedTestModel()
     @StateObject private var monitor = NetMonitor()
+    @StateObject private var radio = RadioMonitor()
+    @StateObject private var scanner = DeviceScanner()
 
     var body: some Scene {
         MenuBarExtra {
-            ContentView(model: model, monitor: monitor)
+            ContentView(model: model, monitor: monitor, radio: radio, scanner: scanner)
         } label: {
             MenuBarLabel(model: model, monitor: monitor)
         }
@@ -882,25 +1169,30 @@ struct MenuBarLabel: View {
 struct ContentView: View {
     @ObservedObject var model: SpeedTestModel
     @ObservedObject var monitor: NetMonitor
+    @ObservedObject var radio: RadioMonitor
+    @ObservedObject var scanner: DeviceScanner
+    @AppStorage("tab") private var tab = "speed"
+
+    // Every tab renders inside one fixed-height frame: a MenuBarExtra(.window)
+    // panel dismisses itself the moment its content changes height.
+    private let bodyHeight: CGFloat = 800
 
     var body: some View {
         VStack(spacing: 0) {
             TopStatsView(model: model)
                 .padding(.top, 16)
                 .padding(.horizontal, 18)
-            ZStack {
-                GaugeView(model: model)
-                centerOverlay
+            TabSwitcher(tab: $tab)
+                .padding(.top, 10)
+            Group {
+                switch tab {
+                case "radio": RadioTab(radio: radio)
+                case "devices": DevicesTab(scanner: scanner)
+                default: speedTab
+                }
             }
-            .frame(height: 206)
-            StatusLine(model: model)
-            VStack(spacing: 8) {
-                HistoryPanel(history: monitor.history).equatable()
-                LiveStrip(monitor: monitor)
-                ResultDetailsView(result: model.lastResult)
-            }
+            .frame(height: bodyHeight, alignment: .top)
             .padding(.top, 8)
-            .padding(.bottom, 12)
             .padding(.horizontal, 14)
             Divider().overlay(Color.faintLine)
             FooterView(model: model, monitor: monitor)
@@ -908,6 +1200,21 @@ struct ContentView: View {
         .frame(width: 320)
         .background(LinearGradient(colors: [.bgTop, .bgBottom], startPoint: .top, endPoint: .bottom))
         .preferredColorScheme(.dark)
+    }
+
+    private var speedTab: some View {
+        VStack(spacing: 8) {
+            ZStack {
+                GaugeView(model: model)
+                centerOverlay
+            }
+            .frame(height: 190)
+            StatusLine(model: model)
+            HistoryPanel(history: monitor.history).equatable()
+            LiveStrip(monitor: monitor)
+            ResultDetailsView(result: model.lastResult)
+            Spacer(minLength: 0)
+        }
     }
 
     @ViewBuilder private var centerOverlay: some View {
@@ -919,6 +1226,309 @@ struct ContentView: View {
         default:
             EmptyView()
         }
+    }
+}
+
+// MARK: - Tab switcher
+
+struct TabSwitcher: View {
+    @Binding var tab: String
+
+    var body: some View {
+        HStack(spacing: 3) {
+            item("Speed", "speed", icon: "speedometer")
+            item("Radio", "radio", icon: "antenna.radiowaves.left.and.right")
+            item("Devices", "devices", icon: "rectangle.connected.to.line.below")
+        }
+        .padding(2)
+        .background(Capsule().fill(Color.white.opacity(0.05)))
+    }
+
+    private func item(_ title: String, _ value: String, icon: String) -> some View {
+        let on = tab == value
+        return Button { tab = value } label: {
+            HStack(spacing: 4) {
+                Image(systemName: icon).font(.system(size: 9, weight: .semibold))
+                Text(title).font(.system(size: 10, weight: .medium))
+            }
+            .foregroundStyle(on ? .white : Color.dimText)
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .background(Capsule().fill(on ? Color.white.opacity(0.12) : .clear))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Radio tab (PowerBeam / airOS)
+
+struct RadioTab: View {
+    @ObservedObject var radio: RadioMonitor
+    @State private var pw = ""
+
+    var body: some View {
+        VStack(spacing: 8) {
+            if !radio.configured {
+                setupCard
+            } else if let s = radio.status {
+                statusCard(s)
+                historyCard
+                readingCard(s)
+                linkCard(s)
+            } else {
+                SectionCard {
+                    sectionLabel("RADIO")
+                    Text(radio.error ?? "Connecting to the radio…")
+                        .font(.system(size: 10))
+                        .foregroundStyle(radio.error == nil ? Color.dimText : .orange)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .lineLimit(3)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var setupCard: some View {
+        SectionCard {
+            sectionLabel("RADIO — NOT CONFIGURED")
+            Text("Point this at your airOS radio (PowerBeam, NanoStation, LiteBeam). The password is stored in your macOS Keychain, never in a file.")
+                .font(.system(size: 10)).foregroundStyle(Color.dimText)
+                .fixedSize(horizontal: false, vertical: true)
+            field("Host / IP", text: $radio.host)
+            field("Username", text: $radio.user)
+            HStack(spacing: 6) {
+                Text("Password").font(.system(size: 9.5)).foregroundStyle(Color.dimText).frame(width: 62, alignment: .leading)
+                SecureField("", text: $pw)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 10).monospacedDigit())
+                    .padding(.horizontal, 6).padding(.vertical, 3)
+                    .background(RoundedRectangle(cornerRadius: 4).fill(Color.white.opacity(0.06)))
+            }
+            Button("Connect") { radio.savePassword(pw); pw = "" }
+                .buttonStyle(.borderedProminent).tint(Color.accentDL).controlSize(.small)
+                .disabled(radio.host.isEmpty || radio.user.isEmpty || pw.isEmpty)
+        }
+    }
+
+    private func field(_ label: String, text: Binding<String>) -> some View {
+        HStack(spacing: 6) {
+            Text(label).font(.system(size: 9.5)).foregroundStyle(Color.dimText).frame(width: 62, alignment: .leading)
+            TextField("", text: text)
+                .textFieldStyle(.plain)
+                .font(.system(size: 10).monospacedDigit())
+                .padding(.horizontal, 6).padding(.vertical, 3)
+                .background(RoundedRectangle(cornerRadius: 4).fill(Color.white.opacity(0.06)))
+        }
+    }
+
+    private func statusCard(_ s: RadioStatus) -> some View {
+        SectionCard {
+            HStack {
+                sectionLabel("RADIO", color: .accentRPM)
+                Spacer()
+                Text(s.model.isEmpty ? radio.host : s.model)
+                    .font(.system(size: 9)).foregroundStyle(Color.dimText).lineLimit(1)
+            }
+            HStack(spacing: 0) {
+                bigStat("SIGNAL", "\(s.signal)", "dBm", signalColor(s.signal))
+                divider
+                bigStat("SNR", "\(s.snr)", "dB", s.snr >= 25 ? .green : s.snr >= 15 ? .yellow : .orange)
+                divider
+                bigStat("CAPACITY", "\(s.amc)", "%", pctColor(s.amc))
+            }
+            Rectangle().fill(Color.white.opacity(0.05)).frame(height: 1)
+            grid(s)
+        }
+    }
+
+    private func grid(_ s: RadioStatus) -> some View {
+        VStack(spacing: 4) {
+            row("airMAX quality", "\(s.amq)%", pctColor(s.amq))
+            row("CCQ", String(format: "%.1f%%", Double(s.ccq) / 10), pctColor(s.ccq / 10))
+            row("TX / RX rate", "\(s.txRate) / \(s.rxRate) Mbps", .white.opacity(0.85))
+            row("Chain balance", s.chains.map(String.init).joined(separator: " / ")
+                + (s.chainSpread > 3 ? "  ⚠︎ \(s.chainSpread) dB" : ""),
+                s.chainSpread > 3 ? .orange : .white.opacity(0.85))
+            row("TX power", "\(s.txPower) dBm", .white.opacity(0.85))
+            row("Noise floor", "\(s.noise) dBm", .white.opacity(0.85))
+        }
+    }
+
+    private func linkCard(_ s: RadioStatus) -> some View {
+        SectionCard {
+            sectionLabel("LINK")
+            VStack(spacing: 4) {
+                row("Connected to", s.essid, .white.opacity(0.85))
+                row("Frequency", s.freq, .white.opacity(0.85))
+                row("Distance", s.distance > 0 ? String(format: "%.2f km", Double(s.distance) / 1000) : "—", .white.opacity(0.85))
+                row("Ethernet", s.ethSpeed > 0 ? "\(s.ethSpeed) Mb full" : "—", .white.opacity(0.85))
+                row("Radio uptime", fmtUptime(s.uptime), .white.opacity(0.85))
+                row("Radio CPU", String(format: "%.0f%%", s.cpu), s.cpu > 70 ? .orange : .white.opacity(0.85))
+                row("Firmware", s.fw, Color.dimText)
+            }
+        }
+    }
+
+    private var historyCard: some View {
+        SectionCard {
+            HStack {
+                sectionLabel("RADIO — LAST HOUR")
+                Spacer()
+                Text("60 s samples").font(.system(size: 9)).foregroundStyle(Color.dimText)
+            }
+            if radio.history.count < 2 {
+                Text("Collecting…").font(.system(size: 10)).foregroundStyle(Color.dimText)
+                    .frame(maxWidth: .infinity).frame(height: 76)
+            } else {
+                VStack(spacing: 6) {
+                    MetricChart(label: "SIGNAL (dBm, higher is better)",
+                                series: [ChartSeries(values: radio.history.map { $0.signal + 100 }, color: .accentDL)],
+                                fmt: { String(format: "%.0f", $0 - 100) }, scrub: nil, minTop: 50, height: 30)
+                    MetricChart(label: "AIRMAX CAPACITY %",
+                                series: [ChartSeries(values: radio.history.map(\.amc), color: .accentRPM)],
+                                fmt: { String(format: "%.0f%%", $0) }, scrub: nil, fixedTop: 100, height: 30)
+                }
+            }
+        }
+    }
+
+    // Turns the raw radio numbers into the sentence you'd say to the WISP.
+    private func readingCard(_ s: RadioStatus) -> some View {
+        SectionCard {
+            sectionLabel("WHAT THIS MEANS")
+            VStack(spacing: 5) {
+                ForEach(verdicts(s), id: \.0) { v in
+                    HStack(spacing: 6) {
+                        Circle().fill(v.2).frame(width: 5, height: 5)
+                        Text(v.0).font(.system(size: 10)).foregroundStyle(.white.opacity(0.85))
+                        Spacer(minLength: 4)
+                        Text(v.1).font(.system(size: 9.5)).foregroundStyle(v.2.opacity(0.9))
+                            .lineLimit(1)
+                    }
+                }
+            }
+        }
+    }
+
+    private func verdicts(_ s: RadioStatus) -> [(String, String, Color)] {
+        var out: [(String, String, Color)] = []
+        let red = Color(red: 1, green: 0.35, blue: 0.35)
+        out.append(("Signal strength",
+                    s.signal >= -60 ? "strong" : s.signal >= -70 ? "weaker than ideal" : "poor — realign",
+                    s.signal >= -60 ? .green : s.signal >= -70 ? .yellow : .orange))
+        out.append(("Noise / SNR",
+                    s.snr >= 25 ? "clean" : s.snr >= 15 ? "marginal" : "buried in noise",
+                    s.snr >= 25 ? .green : s.snr >= 15 ? .yellow : red))
+        out.append(("Dish alignment",
+                    s.chainSpread <= 3 ? "chains balanced" : "\(s.chainSpread) dB off — re-aim",
+                    s.chainSpread <= 3 ? .green : .orange))
+        out.append(("Sector headroom",
+                    s.amc >= 80 ? "plenty" : s.amc >= 50 ? "getting busy" : "oversubscribed — ask WISP",
+                    s.amc >= 80 ? .green : s.amc >= 50 ? .yellow : .orange))
+        out.append(("Link stability",
+                    s.amq >= 80 ? "steady" : s.amq >= 60 ? "some contention" : "unstable polling",
+                    s.amq >= 80 ? .green : s.amq >= 60 ? .yellow : .orange))
+        return out
+    }
+
+    private var divider: some View { Rectangle().fill(Color.faintLine).frame(width: 1, height: 26) }
+
+    private func bigStat(_ label: String, _ value: String, _ unit: String, _ color: Color) -> some View {
+        VStack(spacing: 2) {
+            Text(label).font(.system(size: 8.5, weight: .semibold)).tracking(0.7).foregroundStyle(Color.dimText)
+            HStack(alignment: .firstTextBaseline, spacing: 2) {
+                Text(value).font(.system(size: 15, weight: .semibold, design: .rounded).monospacedDigit())
+                    .foregroundStyle(color)
+                Text(unit).font(.system(size: 9)).foregroundStyle(Color.dimText)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func row(_ k: String, _ v: String, _ c: Color) -> some View {
+        HStack {
+            Text(k).font(.system(size: 10)).foregroundStyle(Color.dimText)
+            Spacer()
+            Text(v.isEmpty ? "—" : v).font(.system(size: 10, weight: .medium).monospacedDigit())
+                .foregroundStyle(c).lineLimit(1)
+        }
+    }
+
+    private func signalColor(_ v: Int) -> Color {
+        v >= -60 ? .green : v >= -70 ? .yellow : v >= -80 ? .orange : Color(red: 1, green: 0.35, blue: 0.35)
+    }
+    private func pctColor(_ v: Int) -> Color {
+        v >= 80 ? .green : v >= 50 ? .yellow : .orange
+    }
+}
+
+func fmtUptime(_ s: Int) -> String {
+    let d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
+    if d > 0 { return "\(d)d \(h)h" }
+    if h > 0 { return "\(h)h \(m)m" }
+    return "\(m)m"
+}
+
+// MARK: - Devices tab
+
+struct DevicesTab: View {
+    @ObservedObject var scanner: DeviceScanner
+
+    var body: some View {
+        VStack(spacing: 8) {
+            SectionCard {
+                HStack {
+                    sectionLabel("DEVICES ON THIS NETWORK", color: .accentRPM)
+                    Spacer()
+                    Text("\(scanner.devices.count) seen")
+                        .font(.system(size: 9)).foregroundStyle(Color.dimText)
+                }
+                if scanner.devices.isEmpty {
+                    Text("Scanning…").font(.system(size: 10)).foregroundStyle(Color.dimText)
+                        .frame(maxWidth: .infinity).frame(height: 60)
+                } else {
+                    VStack(spacing: 3) {
+                        ForEach(scanner.devices.prefix(14)) { d in
+                            HStack(spacing: 6) {
+                                Image(systemName: d.isGateway ? "wifi.router" : d.isSelf ? "laptopcomputer" : "desktopcomputer")
+                                    .font(.system(size: 9))
+                                    .foregroundStyle(d.isGateway ? Color.accentPing : d.isSelf ? Color.accentDL : Color.dimText)
+                                    .frame(width: 13)
+                                Text(d.ip)
+                                    .font(.system(size: 10, weight: .medium).monospacedDigit())
+                                    .foregroundStyle(.white.opacity(0.9))
+                                    .frame(width: 92, alignment: .leading)
+                                Text(d.vendor)
+                                    .font(.system(size: 9.5)).foregroundStyle(Color.dimText)
+                                    .lineLimit(1)
+                                Spacer(minLength: 2)
+                                if d.isGateway { tag("router", .accentPing) }
+                                else if d.isSelf { tag("this Mac", .accentDL) }
+                                Text(d.id.suffix(8))
+                                    .font(.system(size: 8.5).monospacedDigit())
+                                    .foregroundStyle(Color.dimText.opacity(0.7))
+                            }
+                            .frame(height: 15)
+                        }
+                    }
+                }
+            }
+            SectionCard {
+                sectionLabel("WHY THERE ARE NO PER-DEVICE SPEEDS")
+                Text("A switch only sends this Mac its own traffic, so other devices' throughput is invisible from here. The router would have to report it — and this Tenda exposes no traffic API. Per-device graphs need a router that keeps them.")
+                    .font(.system(size: 9.5))
+                    .foregroundStyle(Color.dimText)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func tag(_ s: String, _ c: Color) -> some View {
+        Text(s).font(.system(size: 8, weight: .bold)).foregroundStyle(c)
+            .padding(.horizontal, 4).padding(.vertical, 1.5)
+            .background(Capsule().fill(c.opacity(0.14)))
     }
 }
 
