@@ -353,14 +353,25 @@ final class AppNameResolver {
     }
 }
 
-// One point of history. Float keeps the hour's ring at ~20 KB.
-struct Sample: Equatable {
-    let t: Date
-    let down: Float
-    let up: Float
-    let ping: Float
-    let cpu: Float
-    let ram: Float
+// History is stored as columns, not rows: the charts consume arrays, so rows
+// would force five 720-element maps on every render — including every mouse
+// move while scrubbing. Columns are built once per 5 s sample instead.
+struct HistoryColumns: Equatable {
+    var times: [Date] = []
+    var down: [Float] = [], up: [Float] = [], ping: [Float] = []
+    var cpu: [Float] = [], ram: [Float] = []
+    var count: Int { times.count }
+
+    mutating func append(t: Date, down d: Float, up u: Float, ping p: Float,
+                         cpu c: Float, ram r: Float, cap: Int) {
+        times.append(t); down.append(d); up.append(u)
+        ping.append(p); cpu.append(c); ram.append(r)
+        if times.count > cap {
+            let drop = times.count - cap
+            times.removeFirst(drop); down.removeFirst(drop); up.removeFirst(drop)
+            ping.removeFirst(drop); cpu.removeFirst(drop); ram.removeFirst(drop)
+        }
+    }
 }
 
 // MARK: - Keychain (radio credentials never live in source or defaults)
@@ -580,10 +591,10 @@ final class DeviceScanner: ObservableObject {
     ]
 
     init() {
-        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.scan() }
         }
-        timer?.tolerance = 10
+        timer?.tolerance = 30
         scan()
     }
 
@@ -686,7 +697,7 @@ final class NetMonitor: ObservableObject {
     @Published var topApps: [AppUsage] = []
     @Published var cpuPct: Float = 0
     @Published var ramPct: Float = 0
-    @Published private(set) var history: [Sample] = []
+    @Published private(set) var columns = HistoryColumns()
 
     static let historyCap = 720          // 720 × 5 s = 1 hour
     static let dailyKey = "dailyTotals"  // 31 days of per-day byte totals
@@ -740,10 +751,14 @@ final class NetMonitor: ObservableObject {
         if tickCount % 5 == 1 {          // every 5 s
             if let gw = gateway { pingOnce(gw, into: \.gwPingMs) }
             pingOnce("1.1.1.1", into: \.inetPingMs)
+            recordHistory()
+        }
+        if tickCount % 10 == 1 {         // every 10 s
+            sampleTopApps()
+        }
+        if tickCount % 30 == 1 {         // every 30 s — logged, not live
             let radioHost = UserDefaults.standard.string(forKey: "radioHost") ?? ""
             if !radioHost.isEmpty { pingOnce(radioHost, into: \.pbPingMs) }
-            recordHistory()
-            sampleTopApps()
         }
         if tickCount % 10 == 1 {         // every 10 s
             refreshPrimary()
@@ -755,15 +770,20 @@ final class NetMonitor: ObservableObject {
 
     // MARK: history ring (1 hour at 5 s resolution)
 
+    // Below display resolution nothing on screen can change, so a republish is
+    // pure cost: it dirties the view graph and re-rasterises the menu bar.
+    private func setIfChanged(_ v: Double, _ kp: ReferenceWritableKeyPath<NetMonitor, Double>) {
+        let old = self[keyPath: kp]
+        if abs(v - old) > Swift.max(256, old * 0.02) { self[keyPath: kp] = v }
+    }
+
     private func recordHistory() {
-        cpuPct = sys.cpuPercent()
-        ramPct = sys.ramPercent()
+        let c = sys.cpuPercent(), r = sys.ramPercent()
+        if abs(c - cpuPct) >= 1 { cpuPct = c }
+        if abs(r - ramPct) >= 1 { ramPct = r }
         if let p = inetPingMs, p > 0 { lastGoodPing = Float(p) }
-        history.append(Sample(t: Date(), down: Float(downBps), up: Float(upBps),
-                              ping: lastGoodPing, cpu: cpuPct, ram: ramPct))
-        if history.count > Self.historyCap {
-            history.removeFirst(history.count - Self.historyCap)
-        }
+        columns.append(t: Date(), down: Float(downBps), up: Float(upBps),
+                       ping: lastGoodPing, cpu: cpuPct, ram: ramPct, cap: Self.historyCap)
     }
 
     // MARK: interface byte counters (32-bit in if_data — wrap-safe deltas)
@@ -781,8 +801,8 @@ final class NetMonitor: ObservableObject {
         guard dt > 0.5,
               let din = Self.counterDelta(prev: li, now: inB),
               let dout = Self.counterDelta(prev: lo, now: outB) else { return }
-        downBps = Double(din) / dt
-        upBps = Double(dout) / dt
+        setIfChanged(Double(din) / dt, \.downBps)
+        setIfChanged(Double(dout) / dt, \.upBps)
         rollDayIfNeeded()
         todayDown += din
         todayUp += dout
@@ -873,7 +893,13 @@ final class NetMonitor: ObservableObject {
                 }
             }
             let value = ms
-            await MainActor.run { [weak self] in self?[keyPath: keyPath] = value }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                let old = self[keyPath: keyPath]
+                if old == nil || value == nil || abs((old ?? 0) - (value ?? 0)) >= 0.2 {
+                    self[keyPath: keyPath] = value
+                }
+            }
         }
     }
 
@@ -1309,7 +1335,7 @@ struct ContentView: View {
 
     // Every tab renders inside one fixed-height frame: a MenuBarExtra(.window)
     // panel dismisses itself the moment its content changes height.
-    private let bodyHeight: CGFloat = 800
+    private let bodyHeight: CGFloat = 866
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1344,7 +1370,7 @@ struct ContentView: View {
             }
             .frame(height: 190)
             StatusLine(model: model)
-            HistoryPanel(history: monitor.history).equatable()
+            HistoryPanel(cols: monitor.columns).equatable()
             LiveStrip(monitor: monitor)
             ResultDetailsView(result: model.lastResult)
             Spacer(minLength: 0)
@@ -2155,6 +2181,63 @@ struct ChartSeries {
     let color: Color
 }
 
+// Paths cost up to 720 points each and do NOT depend on the cursor, so they
+// live in their own Equatable view. Moving the mouse then redraws a 1 px line
+// and a few labels instead of rebuilding eight paths per mouse event.
+struct ChartCanvas: View, Equatable {
+    let series: [ChartSeries]
+    let top: Float
+
+    static func == (a: ChartCanvas, b: ChartCanvas) -> Bool {
+        a.top == b.top && a.series.count == b.series.count
+            && zip(a.series, b.series).allSatisfy { $0.values == $1.values }
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .topLeading) {
+                ForEach(series.indices, id: \.self) { i in
+                    let pts = points(series[i].values, in: geo.size)
+                    area(pts, in: geo.size)
+                        .fill(LinearGradient(colors: [series[i].color.opacity(0.28),
+                                                      series[i].color.opacity(0.02)],
+                                             startPoint: .top, endPoint: .bottom))
+                    line(pts)
+                        .stroke(series[i].color, style: StrokeStyle(lineWidth: 1.2, lineJoin: .round))
+                }
+            }
+        }
+    }
+
+    private func points(_ values: [Float], in size: CGSize) -> [CGPoint] {
+        guard values.count > 1, top > 0 else { return [] }
+        let dx = size.width / CGFloat(values.count - 1)
+        let h = size.height
+        return values.enumerated().map { i, v in
+            let frac = Swift.min(CGFloat(Swift.max(v, 0) / top), 1)
+            let y = h - frac * h
+            return CGPoint(x: CGFloat(i) * dx, y: y.isFinite ? y : h)
+        }
+    }
+
+    private func line(_ pts: [CGPoint]) -> Path {
+        var p = Path()
+        guard let first = pts.first else { return p }
+        p.move(to: first)
+        for pt in pts.dropFirst() { p.addLine(to: pt) }
+        return p
+    }
+
+    private func area(_ pts: [CGPoint], in size: CGSize) -> Path {
+        var p = line(pts)
+        guard let first = pts.first, let last = pts.last else { return p }
+        p.addLine(to: CGPoint(x: last.x, y: size.height))
+        p.addLine(to: CGPoint(x: first.x, y: size.height))
+        p.closeSubpath()
+        return p
+    }
+}
+
 struct MetricChart: View {
     let label: String
     let series: [ChartSeries]
@@ -2162,11 +2245,12 @@ struct MetricChart: View {
     let scrub: Int?
     var minTop: Float = 1
     var fixedTop: Float? = nil
-    var height: CGFloat = 32
+    var height: CGFloat = 30
 
+    // compactMap-then-max avoids allocating a flattened 1,440-element array.
     private var top: Float {
         if let fixedTop { return fixedTop }
-        let peak = series.flatMap(\.values).max() ?? 0
+        let peak = series.compactMap { $0.values.max() }.max() ?? 0
         return Swift.max(peak * 1.15, minTop)
     }
 
@@ -2185,21 +2269,14 @@ struct MetricChart: View {
                         .foregroundStyle(series[i].color)
                 }
             }
-            GeometryReader { geo in
-                ZStack(alignment: .topLeading) {
-                    ForEach(series.indices, id: \.self) { i in
-                        let s = series[i]
-                        area(s.values, in: geo.size)
-                            .fill(LinearGradient(colors: [s.color.opacity(0.28), s.color.opacity(0.02)],
-                                                 startPoint: .top, endPoint: .bottom))
-                        line(s.values, in: geo.size)
-                            .stroke(s.color, style: StrokeStyle(lineWidth: 1.2, lineJoin: .round))
-                    }
-                    if let scrub, let n = series.first?.values.count, n > 1 {
-                        let x = geo.size.width * CGFloat(Swift.min(scrub, n - 1)) / CGFloat(n - 1)
-                        Rectangle().fill(Color.white.opacity(0.35))
+            ZStack(alignment: .topLeading) {
+                ChartCanvas(series: series, top: top).equatable()
+                if let scrub, let n = series.first?.values.count, n > 1 {
+                    GeometryReader { geo in
+                        Rectangle()
+                            .fill(Color.white.opacity(0.4))
                             .frame(width: 1, height: geo.size.height)
-                            .offset(x: x)
+                            .offset(x: geo.size.width * CGFloat(Swift.min(scrub, n - 1)) / CGFloat(n - 1))
                     }
                 }
             }
@@ -2207,80 +2284,52 @@ struct MetricChart: View {
             .background(RoundedRectangle(cornerRadius: 4).fill(Color.white.opacity(0.03)))
         }
     }
-
-    private func points(_ values: [Float], in size: CGSize) -> [CGPoint] {
-        guard values.count > 1 else { return [] }
-        let dx = size.width / CGFloat(values.count - 1)
-        let cap = top
-        return values.enumerated().map { i, v in
-            let frac = cap > 0 ? CGFloat(Swift.max(v, 0) / cap) : 0
-            let y = size.height - Swift.min(frac, 1) * size.height
-            return CGPoint(x: CGFloat(i) * dx, y: y.isFinite ? y : size.height)
-        }
-    }
-
-    private func line(_ values: [Float], in size: CGSize) -> Path {
-        var p = Path()
-        let pts = points(values, in: size)
-        guard let first = pts.first else { return p }
-        p.move(to: first)
-        for pt in pts.dropFirst() { p.addLine(to: pt) }
-        return p
-    }
-
-    private func area(_ values: [Float], in size: CGSize) -> Path {
-        var p = line(values, in: size)
-        let pts = points(values, in: size)
-        guard let first = pts.first, let last = pts.last else { return p }
-        p.addLine(to: CGPoint(x: last.x, y: size.height))
-        p.addLine(to: CGPoint(x: first.x, y: size.height))
-        p.closeSubpath()
-        return p
-    }
 }
 
-// Takes history by value and is Equatable, so SwiftUI skips rebuilding four
-// 720-point Paths on the 1 Hz live-rate updates — history only changes every 5 s.
+// Takes columns by value and is Equatable, so the 1 Hz live-rate updates never
+// rebuild the charts — the data only changes every 5 s.
 struct HistoryPanel: View, Equatable {
-    let history: [Sample]
+    let cols: HistoryColumns
     @State private var scrub: Int?
 
-    static func == (a: HistoryPanel, b: HistoryPanel) -> Bool { a.history == b.history }
+    static func == (a: HistoryPanel, b: HistoryPanel) -> Bool { a.cols == b.cols }
+
+    // 4 charts × (8 pt label + 2 spacing + 30 chart) + 3 × 6 spacing.
+    private static let chartsHeight: CGFloat = 186
 
     var body: some View {
-        let h = history
         SectionCard {
             HStack {
                 sectionLabel("LAST HOUR", color: .accentRPM)
                 Spacer()
-                Text(stampText(h))
+                Text(stampText())
                     .font(.system(size: 9).monospacedDigit())
                     .foregroundStyle(scrub == nil ? Color.dimText : .white.opacity(0.8))
             }
-            if h.count < 2 {
+            if cols.count < 2 {
                 Text("Collecting… charts appear after a few samples.")
                     .font(.system(size: 10))
                     .foregroundStyle(Color.dimText)
                     .frame(maxWidth: .infinity)
-                    .frame(height: 176)
+                    .frame(height: Self.chartsHeight)
             } else {
                 GeometryReader { geo in
                     VStack(alignment: .leading, spacing: 6) {
                         MetricChart(label: "NETWORK  ↓ / ↑",
-                                    series: [ChartSeries(values: h.map(\.down), color: .accentDL),
-                                             ChartSeries(values: h.map(\.up), color: .accentUL)],
+                                    series: [ChartSeries(values: cols.down, color: .accentDL),
+                                             ChartSeries(values: cols.up, color: .accentUL)],
                                     fmt: { fmtRate(Double($0)) + "B/s" },
                                     scrub: scrub, minTop: 50_000)
                         MetricChart(label: "PING",
-                                    series: [ChartSeries(values: h.map(\.ping), color: .accentPing)],
+                                    series: [ChartSeries(values: cols.ping, color: .accentPing)],
                                     fmt: { String(format: "%.0f ms", $0) },
                                     scrub: scrub, minTop: 50)
                         MetricChart(label: "CPU",
-                                    series: [ChartSeries(values: h.map(\.cpu), color: .accentRPM)],
+                                    series: [ChartSeries(values: cols.cpu, color: .accentRPM)],
                                     fmt: { String(format: "%.0f%%", $0) },
                                     scrub: scrub, fixedTop: 100)
                         MetricChart(label: "MEMORY",
-                                    series: [ChartSeries(values: h.map(\.ram), color: .accentMid)],
+                                    series: [ChartSeries(values: cols.ram, color: .accentMid)],
                                     fmt: { String(format: "%.0f%%", $0) },
                                     scrub: scrub, fixedTop: 100)
                     }
@@ -2288,28 +2337,31 @@ struct HistoryPanel: View, Equatable {
                     .onContinuousHover { phase in
                         switch phase {
                         case .active(let pt):
-                            guard geo.size.width > 0, h.count > 1 else { return }
+                            guard geo.size.width > 0, cols.count > 1 else { return }
                             let frac = min(max(pt.x / geo.size.width, 0), 1)
-                            scrub = Int((frac * CGFloat(h.count - 1)).rounded())
+                            let idx = Int((frac * CGFloat(cols.count - 1)).rounded())
+                            // Skip redundant writes: hover fires far faster than
+                            // the cursor actually crosses a sample.
+                            if idx != scrub { scrub = idx }
                         case .ended:
-                            scrub = nil
+                            if scrub != nil { scrub = nil }
                         }
                     }
                 }
-                .frame(height: 176)
+                .frame(height: Self.chartsHeight)
             }
         }
     }
 
-    private func stampText(_ h: [Sample]) -> String {
-        guard let first = h.first, let last = h.last else { return "—" }
-        if let scrub, h.indices.contains(scrub) {
+    private func stampText() -> String {
+        guard let first = cols.times.first, let last = cols.times.last else { return "—" }
+        if let scrub, cols.times.indices.contains(scrub) {
             let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
-            let ago = Int(last.t.timeIntervalSince(h[scrub].t).rounded())
-            return ago < 5 ? "now · \(f.string(from: h[scrub].t))"
-                           : "\(ago / 60 > 0 ? "\(ago / 60)m " : "")\(ago % 60)s ago · \(f.string(from: h[scrub].t))"
+            let ago = Int(last.timeIntervalSince(cols.times[scrub]).rounded())
+            return ago < 5 ? "now · \(f.string(from: cols.times[scrub]))"
+                           : "\(ago / 60 > 0 ? "\(ago / 60)m " : "")\(ago % 60)s ago · \(f.string(from: cols.times[scrub]))"
         }
-        let span = Int(last.t.timeIntervalSince(first.t) / 60)
+        let span = Int(last.timeIntervalSince(first) / 60)
         return span < 1 ? "hover to scrub" : "\(span) min · hover to scrub"
     }
 }
