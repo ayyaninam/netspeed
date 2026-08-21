@@ -465,6 +465,10 @@ final class RadioMonitor: ObservableObject {
                 case .success(let s):
                     self.status = s
                     self.error = nil
+                    let shared = SharedRadio.shared
+                    shared.signal = s.signal; shared.snr = s.snr
+                    shared.amc = s.amc; shared.ccq = s.ccq
+                    shared.reachable = true; shared.updatedAt = Date()
                     self.history.append(RadioSample(t: Date(), signal: Float(s.signal),
                                                     amc: Float(s.amc), ccq: Float(s.ccq) / 10))
                     if self.history.count > Self.cap {
@@ -472,6 +476,8 @@ final class RadioMonitor: ObservableObject {
                     }
                 case .failure(let e):
                     self.error = e.message
+                    SharedRadio.shared.reachable = false
+                    SharedRadio.shared.updatedAt = Date()
                 }
             }
         }
@@ -648,6 +654,18 @@ final class DeviceScanner: ObservableObject {
     }
 }
 
+// MARK: - Shared radio snapshot
+// The logger needs the radio's numbers on the same row as the network ones, so
+// RadioMonitor publishes its latest reading here and NetMonitor reads it.
+
+@MainActor
+final class SharedRadio {
+    static let shared = SharedRadio()
+    var signal = 0, snr = 0, amc = 0, ccq = 0
+    var reachable = false
+    var updatedAt: Date?
+}
+
 // MARK: - Live network monitor
 // Lightweight by design: a 2 s byte-counter poll (getifaddrs syscall, no
 // subprocess), pings + CSV log every 10 s, and per-app sampling (nettop)
@@ -687,6 +705,17 @@ final class NetMonitor: ObservableObject {
     private let sys = SysSampler()
     private var lastGoodPing: Float = 0
     private let names = AppNameResolver()
+    // fault-isolation state
+    private var pbPingMs: Double?
+    private var linkMbit = 0
+    private var errIn: UInt32 = 0
+    private var errOut: UInt32 = 0
+    private var lastErrTotal: UInt32 = 0
+    private var prevIface = ""
+    private var prevLinkMbit = 0
+    private var routeLostAt: Date?
+    private var lastTickAt: Date?
+    private var radioWasReachable = true
 
     init() {
         logDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -700,6 +729,8 @@ final class NetMonitor: ObservableObject {
             Task { @MainActor in self?.tick() }
         }
         timer?.tolerance = 0.2
+        prevIface = iface
+        logEvent("app_start", "NetSpeed launched")
         tick()
     }
 
@@ -709,11 +740,14 @@ final class NetMonitor: ObservableObject {
         if tickCount % 5 == 1 {          // every 5 s
             if let gw = gateway { pingOnce(gw, into: \.gwPingMs) }
             pingOnce("1.1.1.1", into: \.inetPingMs)
+            let radioHost = UserDefaults.standard.string(forKey: "radioHost") ?? ""
+            if !radioHost.isEmpty { pingOnce(radioHost, into: \.pbPingMs) }
             recordHistory()
             sampleTopApps()
         }
         if tickCount % 10 == 1 {         // every 10 s
             refreshPrimary()
+            detectEvents()
             appendLog()
             persistToday()
         }
@@ -735,7 +769,11 @@ final class NetMonitor: ObservableObject {
     // MARK: interface byte counters (32-bit in if_data — wrap-safe deltas)
 
     private func sampleCounters() {
-        guard !iface.isEmpty, let (inB, outB) = Self.linkBytes(iface) else { return }
+        guard !iface.isEmpty, let st = Self.linkStats(iface) else { return }
+        let inB = st.inBytes, outB = st.outBytes
+        linkMbit = st.mbit
+        errIn = st.ierrs
+        errOut = st.oerrs
         let now = Date()
         defer { lastIn = inB; lastOut = outB; lastSampleAt = now }
         guard let li = lastIn, let lo = lastOut, let t = lastSampleAt else { return }
@@ -763,7 +801,14 @@ final class NetMonitor: ObservableObject {
         return UInt64(now &- prev)
     }
 
-    private static func linkBytes(_ name: String) -> (UInt32, UInt32)? {
+    struct LinkStats {
+        let inBytes: UInt32, outBytes: UInt32
+        let ierrs: UInt32, oerrs: UInt32
+        let baudrate: UInt32
+        var mbit: Int { Int(baudrate / 1_000_000) }
+    }
+
+    static func linkStats(_ name: String) -> LinkStats? {
         var ifap: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifap) == 0 else { return nil }
         defer { freeifaddrs(ifap) }
@@ -774,12 +819,15 @@ final class NetMonitor: ObservableObject {
                String(cString: ifa.ifa_name) == name,
                let data = ifa.ifa_data {
                 let d = data.assumingMemoryBound(to: if_data.self).pointee
-                return (d.ifi_ibytes, d.ifi_obytes)
+                return LinkStats(inBytes: d.ifi_ibytes, outBytes: d.ifi_obytes,
+                                 ierrs: d.ifi_ierrors, oerrs: d.ifi_oerrors,
+                                 baudrate: d.ifi_baudrate)
             }
             cursor = ifa.ifa_next
         }
         return nil
     }
+
 
     // MARK: primary interface / network name / gateway (SystemConfiguration)
 
@@ -887,6 +935,8 @@ final class NetMonitor: ObservableObject {
     private func rollDayIfNeeded() {
         let today = Self.dayString()
         if today != dayKey {
+            writeDailyRollup(for: dayKey, down: todayDown, up: todayUp)
+            logEvent("day_rollover", "\(dayKey) -> \(today)")
             dayKey = today
             todayDown = 0; todayUp = 0
             pruneOldLogs()
@@ -948,34 +998,118 @@ final class NetMonitor: ObservableObject {
 
     // MARK: CSV log
 
+    // Columns are grouped so a reader can attribute a fault: gw_ms is cable +
+    // switch port + router; pb_ms adds the router's forwarding to the radio;
+    // inet_ms adds the radio link and the ISP; rssi/amc say whether the radio
+    // itself was degrading. ierrs/oerrs and link_mbit catch a failing cable.
+    private static let logHeader =
+        "time,down_Bps,up_Bps,gw_ms,pb_ms,inet_ms,cpu_pct,ram_pct," +
+        "link_mbit,ierrs,oerrs,rssi,snr,amc,ccq,network,iface,top_app\n"
+
     private func appendLog() {
         let file = logDir.appendingPathComponent("netlog-\(Self.dayString()).csv")
         if !FileManager.default.fileExists(atPath: file.path) {
-            try? "time,down_Bps,up_Bps,ping_gw_ms,ping_inet_ms,network,iface,top_app\n"
-                .write(to: file, atomically: true, encoding: .utf8)
+            try? Self.logHeader.write(to: file, atomically: true, encoding: .utf8)
         }
+        let r = SharedRadio.shared
+        let fresh = (r.updatedAt.map { Date().timeIntervalSince($0) < 180 } ?? false) && r.reachable
         let safeName = netName.replacingOccurrences(of: ",", with: " ")
         let topName = (topApps.first?.name ?? "").replacingOccurrences(of: ",", with: " ")
-        let row = String(
-            format: "%@,%.0f,%.0f,%@,%@,%@,%@,%@\n",
-            Self.timeString(), downBps, upBps,
-            gwPingMs.map { String(format: "%.1f", $0) } ?? "",
-            inetPingMs.map { String(format: "%.1f", $0) } ?? "",
-            safeName, iface, topName)
+        let ms: (Double?) -> String = { $0.map { String(format: "%.1f", $0) } ?? "" }
+        let row = "\(Self.timeString()),\(Int(downBps)),\(Int(upBps)),"
+            + "\(ms(gwPingMs)),\(ms(pbPingMs)),\(ms(inetPingMs)),"
+            + String(format: "%.0f,%.0f,", cpuPct, ramPct)
+            + "\(linkMbit),\(errIn),\(errOut),"
+            + (fresh ? "\(r.signal),\(r.snr),\(r.amc),\(r.ccq)," : ",,,,")
+            + "\(safeName),\(iface),\(topName)\n"
+        append(row, to: file)
+    }
+
+    private func append(_ text: String, to file: URL) {
         if let h = try? FileHandle(forWritingTo: file) {
             h.seekToEndOfFile()
-            h.write(Data(row.utf8))
+            h.write(Data(text.utf8))
             try? h.close()
         }
     }
 
-    // Retention: today's file only — anything else gets removed (runs at
-    // launch and again on every day rollover).
+    // MARK: events — the timeline that explains an outage after the fact
+
+    func logEvent(_ kind: String, _ detail: String) {
+        let file = logDir.appendingPathComponent("events.csv")
+        if !FileManager.default.fileExists(atPath: file.path) {
+            try? "time,event,detail\n".write(to: file, atomically: true, encoding: .utf8)
+        }
+        append("\(Self.timeString()),\(kind),\(detail.replacingOccurrences(of: ",", with: " "))\n", to: file)
+    }
+
+    private func detectEvents() {
+        let now = Date()
+        // A sampling gap means the Mac slept — without this, sleep reads as downtime.
+        if let last = lastTickAt, now.timeIntervalSince(last) > 90 {
+            logEvent("sleep_gap", String(format: "%.0f min not sampled", now.timeIntervalSince(last) / 60))
+        }
+        lastTickAt = now
+
+        if iface.isEmpty, routeLostAt == nil {
+            routeLostAt = now
+            logEvent("route_lost", "no default route — LAN side (router, cable or adapter)")
+        } else if !iface.isEmpty, let lost = routeLostAt {
+            logEvent("route_restored", String(format: "down %.1f min", now.timeIntervalSince(lost) / 60))
+            routeLostAt = nil
+        }
+
+        if !iface.isEmpty, iface != prevIface {
+            if !prevIface.isEmpty { logEvent("iface_changed", "\(prevIface) -> \(iface)") }
+            prevIface = iface
+            prevLinkMbit = 0
+            lastErrTotal = 0
+        }
+        if linkMbit > 0, linkMbit != prevLinkMbit {
+            if prevLinkMbit > 0 {
+                logEvent("link_speed_changed", "\(prevLinkMbit) -> \(linkMbit) Mb — suspect cable if it dropped")
+            }
+            prevLinkMbit = linkMbit
+        }
+        let errTotal = errIn &+ errOut
+        if errTotal > lastErrTotal {
+            if lastErrTotal > 0 {
+                logEvent("iface_errors", "+\(errTotal - lastErrTotal) on \(iface) — cable or port")
+            }
+            lastErrTotal = errTotal
+        }
+        let r = SharedRadio.shared
+        if let u = r.updatedAt, Date().timeIntervalSince(u) < 180 {
+            if r.reachable != radioWasReachable {
+                logEvent(r.reachable ? "radio_up" : "radio_down", r.reachable ? "" : "PowerBeam not answering")
+                radioWasReachable = r.reachable
+            }
+        }
+    }
+
+    // MARK: daily rollup — one tiny row per day, kept indefinitely
+
+    private func writeDailyRollup(for day: String, down: UInt64, up: UInt64) {
+        let file = logDir.appendingPathComponent("daily.csv")
+        if !FileManager.default.fileExists(atPath: file.path) {
+            try? "date,down_bytes,up_bytes,down_gb,up_gb\n".write(to: file, atomically: true, encoding: .utf8)
+        }
+        let row = String(format: "%@,%llu,%llu,%.2f,%.2f\n", day, down, up,
+                         Double(down) / 1e9, Double(up) / 1e9)
+        append(row, to: file)
+    }
+
+    // Retention: 7 days of per-second detail (~2 MB/day). events.csv and
+    // daily.csv are tiny and are never pruned.
     private func pruneOldLogs() {
-        let keep = "netlog-\(Self.dayString()).csv"
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd"
+        let keep = Set((0..<7).compactMap {
+            Calendar.current.date(byAdding: .day, value: -$0, to: Date())
+        }.map { "netlog-\(f.string(from: $0)).csv" })
         let files = (try? FileManager.default.contentsOfDirectory(at: logDir, includingPropertiesForKeys: nil)) ?? []
-        for f in files where f.lastPathComponent.hasPrefix("netlog-") && f.lastPathComponent != keep {
-            try? FileManager.default.removeItem(at: f)
+        for file in files where file.lastPathComponent.hasPrefix("netlog-")
+            && !keep.contains(file.lastPathComponent) {
+            try? FileManager.default.removeItem(at: file)
         }
     }
 
